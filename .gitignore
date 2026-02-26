@@ -1,0 +1,9 @@
+node_modules/
+.DS_Store
+.vscode/
+Models_new_not_working_with_native_messaging
+bin/
+obj/
+publish/
+publish-osx-arm64
+*.zip

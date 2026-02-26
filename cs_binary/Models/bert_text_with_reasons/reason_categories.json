@@ -1,0 +1,13 @@
+{
+  "positive_interaction": 0,
+  "educational_content": 1,
+  "bullying_harassment": 2,
+  "threats_violence": 3,
+  "dangerous_weapons": 4,
+  "inappropriate_behavior": 5,
+  "secrecy_manipulation": 6,
+  "personal_info_request": 7,
+  "contact_info_sharing": 8,
+  "predatory_behavior": 9,
+  "inappropriate_content": 10
+}

@@ -1,0 +1,31 @@
+# Dependencies for running the classifier
+
+# Option 1: PyTorch version (full PyTorch) - needed for training
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Option 2: ONNX version (lightweight, for image inference)
+onnxruntime>=1.15.0
+onnx>=1.15.0
+onnxscript>=0.6.0
+
+# Common dependencies
+transformers>=4.30.0
+flask>=3.0.0
+Pillow>=10.0.0
+requests>=2.28.0
+numpy>=1.24.0
+
+# Additional dependencies for enhanced training and validation
+scikit-learn>=1.3.0
+
+# HTML processing dependencies
+beautifulsoup4>=4.12.0
+requests>=2.31.0
+
+# PDF processing dependencies (for PDF classifier)
+PyPDF2>=3.0.0
+PyMuPDF>=1.23.0
+
+# Dataset loading (for training with phishing datasets)
+datasets>=4.0.0

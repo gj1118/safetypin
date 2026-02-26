@@ -1,0 +1,82 @@
+# Justfile for classifier project
+
+# Setup local dev environment with uv
+setup:
+    uv venv
+    uv pip install -r requirements.txt
+
+# Install dependencies (for existing venv)
+install:
+    uv pip install -r requirements.txt
+
+# Clear Python cache and model cache, then run the classifier server
+serve:
+    #!/usr/bin/env bash
+    set -e
+
+    echo "Clearing Python cache..."
+    find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+    find . -name "*.pyc" -delete 2>/dev/null || true
+
+    echo "Clearing potential model cache..."
+    # Remove any .onnx.cache files or similar
+    find . -name "*.onnx.cache" -delete 2>/dev/null || true
+    find . -name "*.pkl.cache" -delete 2>/dev/null || true
+
+    echo "Starting server with fresh cache..."
+    uv run python server.py
+
+# Run the classifier server (simple version without cache clearing)
+serve-simple:
+    uv run python server.py
+
+# Train text classifier only
+train-text:
+    uv run python train_text.py
+
+# Train image classifier only
+train-image:
+    uv run python train_image.py
+
+# Train both classifiers
+train-all: train-text train-image
+    echo "finished training images as well as text"
+
+# Train both from scratch (backup current models, create new output folder, then train)
+train-fresh:
+    #!/usr/bin/env bash
+    set -e
+
+    TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+
+    if [ -d "output" ] && [ "$(ls -A output)" ]; then
+        echo "Backing up current output folder to model_ver_${TIMESTAMP}.zip"
+        zip -r "model_ver_${TIMESTAMP}.zip" output/
+        rm -rf output
+    fi
+
+    mkdir -p output/bert_text output/image
+
+    echo "Training fresh models..."
+    just train-text
+    just train-image
+
+    echo "Fresh training complete. Backup saved as model_ver_${TIMESTAMP}.zip"
+
+# Export image classifier to ONNX
+export-image:
+    uv run python export_image.py
+
+# Export text classifier to ONNX
+export-text:
+    uv run python export_text.py
+
+# Export domain classifier to ONNX
+export-domain:
+    uv run python export_domain.py
+
+# Export all classifiers to ONNX
+export-all:
+    just export-image
+    just export-text
+    just export-domain 
