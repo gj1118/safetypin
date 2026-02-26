@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { AlertTriangle, CheckCircle2, FileText, Globe, ImageIcon, Loader2, Shield, HeartPlus, Settings } from "lucide-react";
 import { useNativeMessaging } from "../hooks/useNativeMessaging";
 
 function Popup() {
@@ -35,20 +36,87 @@ function Popup() {
 
   const isSafe = analysisResult?.page_classification !== "bad";
   const confidence = analysisResult ? (analysisResult.page_confidence * 100).toFixed(1) : null;
+  const domainRisk = typeof analysisResult?.domain_analysis?.risk_score === "number"
+    ? analysisResult.domain_analysis.risk_score
+    : null;
+  const domainSafety = typeof analysisResult?.domain_analysis?.risk_score === "number"
+    ? ((1 - analysisResult.domain_analysis.risk_score) * 100).toFixed(1)
+    : null;
+  const badImageItems = analysisResult?.image_analysis?.bad_image_elements || [];
+  const badTextItems = analysisResult?.text_analysis?.bad_text_elements || [];
+  const domainTone = domainRisk === null
+    ? {
+        iconBg: "bg-slate-100",
+        iconText: "text-slate-700",
+        badgeBg: "bg-slate-100",
+        badgeText: "text-slate-700",
+      }
+    : domainRisk >= 0.9
+      ? {
+          iconBg: "bg-rose-100",
+          iconText: "text-rose-700",
+          badgeBg: "bg-rose-100",
+          badgeText: "text-rose-700",
+        }
+      : domainRisk >= 0.5
+        ? {
+            iconBg: "bg-amber-100",
+            iconText: "text-amber-700",
+            badgeBg: "bg-amber-100",
+            badgeText: "text-amber-700",
+          }
+        : {
+            iconBg: "bg-emerald-100",
+            iconText: "text-emerald-700",
+            badgeBg: "bg-emerald-100",
+            badgeText: "text-emerald-700",
+          };
+
+  const openDetailsPage = async (section) => {
+    if (!analysisResult) return;
+
+    const items = section === "images" ? badImageItems : badTextItems;
+    if (!items.length) return;
+
+    if (typeof chrome === "undefined" || !chrome.storage?.local || !chrome.tabs?.create || !chrome.runtime?.getURL) {
+      return;
+    }
+
+    const reportId = `finding_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const reportPayload = {
+      section,
+      createdAt: Date.now(),
+      requestedUrl: analysisResult.requested_url || "",
+      domain: analysisResult?.domain_analysis?.domain || "",
+      category: analysisResult?.domain_analysis?.category || "unknown",
+      items,
+    };
+
+    await chrome.storage.local.set({ [reportId]: reportPayload });
+    const detailsUrl = chrome.runtime.getURL(`blocked.html?view=details&section=${encodeURIComponent(section)}&id=${encodeURIComponent(reportId)}`);
+    await chrome.tabs.create({ url: detailsUrl });
+  };
+
+  const openSettingsPopup = async () => {
+    if (typeof chrome === "undefined" || !chrome.runtime?.getURL || !chrome.tabs?.create) {
+      return;
+    }
+
+    const settingsUrl = chrome.runtime.getURL("settings.html");
+    await chrome.tabs.create({ url: settingsUrl });
+  };
 
   return (
-    <div className="min-h-[460px] bg-gradient-to-b from-slate-50 to-slate-100 flex flex-col">
+    <div className="min-h-[600px] bg-gradient-to-b from-slate-50 to-slate-100 flex flex-col">
 
-      <header className="border-b border-slate-200 bg-white px-5 py-4">
+      <header className="border-b border-slate-200 bg-white px-5 py-4" >
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2.5">
             <div className="size-9 rounded-xl bg-indigo-600 flex items-center justify-center shadow-sm">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-              </svg>
+              <Shield className="size-4 text-white" strokeWidth={2.5} />
             </div>
             <div>
-              <h1 className="text-base font-semibold tracking-tight text-slate-900">SafetyPin</h1>
+              <h1 className="text-base font-semibold tracking-tight text-slate-900">SafeNest</h1>
               <p className="text-[11px] text-slate-500">Child safety monitor</p>
             </div>
           </div>
@@ -64,7 +132,7 @@ function Popup() {
 
       <div className="flex-1 overflow-y-auto px-5 py-4">
         {analysisResult && (
-          <div className="rounded-2xl bg-white border border-slate-200/80 shadow-sm p-4 space-y-4 py-2">
+          <div >
             <div className={`rounded-xl px-3.5 py-3 border ${
               isSafe
                 ? "bg-emerald-50 border-emerald-200/70"
@@ -73,13 +141,9 @@ function Popup() {
               <div className="flex items-start gap-2.5">
                 <div className={`mt-0.5 size-5 shrink-0 ${isSafe ? "text-emerald-600" : "text-rose-600"}`}>
                   {isSafe ? (
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>
-                    </svg>
+                    <CheckCircle2 className="size-5" />
                   ) : (
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
-                    </svg>
+                    <AlertTriangle className="size-5" />
                   )}
                 </div>
 
@@ -94,7 +158,7 @@ function Popup() {
               </div>
             </div>
 
-            <div>
+            <div className="my-4">
               <div className="flex items-center justify-between mb-1.5">
                 <span className="text-xs font-medium text-slate-600">Confidence</span>
                 <span className="text-xs font-semibold text-slate-700">{confidence}%</span>
@@ -108,12 +172,35 @@ function Popup() {
             </div>
 
             <div className="grid grid-cols-1 gap-2.5">
+              {analysisResult.domain_analysis && (
+                <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3.5 py-3 flex items-start gap-3">
+                  <div className={`size-8 rounded-lg ${domainTone.iconBg} ${domainTone.iconText} flex items-center justify-center shrink-0 mt-0.5`}>
+                    <Globe className="size-[14px]" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-xs font-semibold text-slate-900">Domain safety</p>
+                      <span className={`inline-flex rounded-md ${domainTone.badgeBg} ${domainTone.badgeText} px-1.5 py-0.5 text-[11px] font-semibold`}>
+                        {domainSafety ? `${domainSafety}%` : "N/A"}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[11px] leading-4 text-slate-500 line-clamp-2">
+                      {analysisResult.domain_analysis.domain || "unknown domain"}
+                      {analysisResult.domain_analysis.category ? ` • ${analysisResult.domain_analysis.category}` : ""}
+                    </p>
+                  </div>
+                </div>
+              )}
+
               {analysisResult.image_analysis && (
-                <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3.5 py-3 flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => openDetailsPage("images")}
+                  disabled={badImageItems.length === 0}
+                  className={`w-full text-left rounded-xl border border-slate-200 bg-slate-50/70 px-3.5 py-3 flex items-center gap-3 transition-colors ${badImageItems.length > 0 ? "cursor-pointer hover:bg-slate-100/80" : "cursor-default"}`}
+                >
                   <div className="size-8 rounded-lg bg-violet-100 text-violet-700 flex items-center justify-center shrink-0">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/>
-                    </svg>
+                    <ImageIcon className="size-[14px]" />
                   </div>
                   <div className="flex-1 min-w-0">
                     <p className="text-xs font-semibold text-slate-900">Image scan</p>
@@ -123,15 +210,18 @@ function Popup() {
                     <span className="inline-flex rounded-md bg-rose-100 text-rose-700 px-1.5 py-0.5 font-semibold">{analysisResult.image_analysis.bad_images}</span>
                     <span className="inline-flex rounded-md bg-emerald-100 text-emerald-700 px-1.5 py-0.5 font-semibold">{analysisResult.image_analysis.good_images}</span>
                   </div>
-                </div>
+                </button>
               )}
 
               {analysisResult.text_analysis && (
-                <div className="rounded-xl border border-slate-200 bg-slate-50/70 px-3.5 py-3 flex items-start gap-3">
+                <button
+                  type="button"
+                  onClick={() => openDetailsPage("text")}
+                  disabled={badTextItems.length === 0}
+                  className={`w-full text-left rounded-xl border border-slate-200 bg-slate-50/70 px-3.5 py-3 flex items-start gap-3 transition-colors ${badTextItems.length > 0 ? "cursor-pointer hover:bg-slate-100/80" : "cursor-default"}`}
+                >
                   <div className="size-8 rounded-lg bg-sky-100 text-sky-700 flex items-center justify-center shrink-0 mt-0.5">
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/>
-                    </svg>
+                    <FileText className="size-[14px]" />
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center justify-between gap-2">
@@ -148,7 +238,7 @@ function Popup() {
                       <p className="mt-1 text-[11px] leading-4 text-slate-500 line-clamp-2">{analysisResult.text_analysis.reason}</p>
                     )}
                   </div>
-                </div>
+                </button>
               )}
             </div>
           </div>
@@ -157,9 +247,7 @@ function Popup() {
         {!analysisResult && !loading && (
           <div className="h-full min-h-[220px] flex flex-col items-center justify-center text-center">
             <div className="size-12 rounded-full bg-white border border-slate-200 shadow-sm flex items-center justify-center mb-3">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#64748b" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-              </svg>
+              <Shield className="size-5 text-slate-500" strokeWidth={1.8} />
             </div>
             <p className="text-sm font-semibold text-slate-900">Ready to scan this page</p>
             <p className="mt-1 text-xs text-slate-500">Run verification to see a full safety report.</p>
@@ -169,10 +257,7 @@ function Popup() {
         {loading && !analysisResult && (
           <div className="h-full min-h-[220px] flex flex-col items-center justify-center text-center">
             <div className="size-10 mb-3">
-              <svg className="animate-spin text-indigo-600" viewBox="0 0 24 24" fill="none">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"/>
-              </svg>
+              <Loader2 className="size-10 animate-spin text-indigo-600" />
             </div>
             <p className="text-sm font-semibold text-slate-900">Analyzing page…</p>
             <p className="mt-1 text-xs text-slate-500">Checking text and media content</p>
@@ -185,9 +270,9 @@ function Popup() {
           <button
             onClick={verifyUrl}
             disabled={loading}
-            className="inline-flex min-w-[230px] items-center justify-center rounded-2xl bg-indigo-600 px-10 py-4 text-sm font-semibold tracking-tight text-white shadow-[0_10px_20px_rgba(79,70,229,0.28)] hover:bg-indigo-500 transition-all focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 disabled:bg-indigo-400 disabled:cursor-not-allowed"
+            className="inline-flex min-w-[230px] items-center justify-center rounded-2xl bg-indigo-600 px-10 py-2 text-sm font-semibold tracking-tight text-white shadow-[0_10px_20px_rgba(79,70,229,0.28)] hover:bg-indigo-500 transition-all focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 disabled:bg-indigo-400 disabled:cursor-not-allowed"
           >
-            {loading ? "Scanning…" : "Verify Current Page"}
+            {loading ? "Scanning…" : "Run Verification"}
           </button>
         </div>
 
@@ -197,7 +282,14 @@ function Popup() {
             disabled={loading}
             className="inline-flex items-center rounded-lg px-3 py-2 text-xs font-medium text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            Send Heartbeat
+            <HeartPlus className="size-4 mr-1" />Send Heartbeat
+          </button>
+                    <button
+            onClick={openSettingsPopup}
+            disabled={loading}
+            className="inline-flex items-center rounded-lg px-3 py-2 text-xs font-medium text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Settings className="size-4 mr-1" />Settings
           </button>
         </div>
       </div>

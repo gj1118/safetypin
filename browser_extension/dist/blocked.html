@@ -33,9 +33,16 @@
           #f8fafc;
       }
 
+      #app {
+        width: 100%;
+        display: flex;
+        justify-content: center;
+      }
+
       .container {
         text-align: center;
         width: min(100%, 520px);
+        margin: 0 auto;
         padding: 28px 26px 24px;
         background: rgba(255, 255, 255, 0.9);
         border: 1px solid rgba(148, 163, 184, 0.2);
@@ -144,6 +151,71 @@
         margin: 0;
       }
 
+      .details-shell {
+        width: min(100%, 860px);
+        margin: 0 auto;
+        background: rgba(255, 255, 255, 0.94);
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        border-radius: 18px;
+        box-shadow: 0 16px 34px rgba(15, 23, 42, 0.12);
+        padding: 22px;
+        font-size: 16px;
+      }
+
+      .details-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 14px;
+        margin-bottom: 14px;
+      }
+
+      .details-title {
+        margin: 0;
+        font-size: 24px;
+        letter-spacing: -0.02em;
+        color: #0f172a;
+      }
+
+      .details-meta {
+        margin: 6px 0 0;
+        font-size: 14px;
+        color: #64748b;
+      }
+
+      .details-list {
+        display: grid;
+        gap: 10px;
+      }
+
+      .details-item {
+        border: 1px solid #e2e8f0;
+        border-radius: 12px;
+        background: #f8fafc;
+        padding: 12px;
+      }
+
+      .details-item h3 {
+        margin: 0 0 8px;
+        font-size: 20px;
+        color: #0f172a;
+      }
+
+      .details-item p {
+        margin: 6px 0;
+        font-size: 20px;
+        color: #334155;
+        max-width: 100%;
+      }
+
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        background: #f1f5f9;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 2px 6px;
+      }
+
       @media (max-width: 480px) {
         .container {
           padding: 24px 18px 20px;
@@ -157,30 +229,7 @@
     </style>
   </head>
   <body>
-    <div class="container">
-      <img class="hero-art" src="./assets/images/stop.png" alt="Blocked by SafetyPin" />
-      <div class="pill"><span class="dot"></span>Safety Alert</div>
-      <h1>Page blocked for safety</h1>
-      <p>
-        SafetyPin blocked this page because it appears to contain unsafe or
-        inappropriate content.
-      </p>
-      <div class="url" id="blockedUrl"></div>
-      <div class="actions">
-        <button id="closeBtn">Close this page</button>
-        <p class="subtext">You can return to a safer page anytime.</p>
-      </div>
-    </div>
-    <script>
-      const params = new URLSearchParams(window.location.search);
-      document.getElementById("blockedUrl").textContent =
-        params.get("url") || "Unknown";
-
-      document
-        .getElementById("closeBtn")
-        .addEventListener("click", function () {
-          chrome.tabs.close();
-        });
-    </script>
+    <div id="app"></div>
+    <script src="./blocked.js"></script>
   </body>
 </html>

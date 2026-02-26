@@ -3,7 +3,11 @@
  * Runs on monitored websites to analyze content
  */
 
-console.log("SafetyPin: Content script loaded!");
+console.log("SafeNest: Content script loaded!");
+
+let chatObserver = null;
+let inputMonitorIntervalId = null;
+let reinitTimeoutId = null;
 
 // Pattern detection (client-side quick check before sending to OS)
 const RISK_PATTERNS = {
@@ -67,8 +71,8 @@ const siteConfig = Object.entries(SITE_SELECTORS).find(([site]) =>
   hostname.includes(site),
 )?.[1];
 
-console.log("SafetyPin: Script running on:", hostname);
-console.log("SafetyPin: Site config found:", siteConfig);
+console.log("SafeNest: Script running on:", hostname);
+console.log("SafeNest: Site config found:", siteConfig);
 
 /**
  * Analyze text for risk patterns
@@ -78,6 +82,7 @@ function analyzeText(text) {
 
   for (const [category, config] of Object.entries(RISK_PATTERNS)) {
     for (const pattern of config.patterns) {
+      pattern.lastIndex = 0;
       if (pattern.test(text)) {
         risks.push({
           category,
@@ -126,6 +131,10 @@ function sendToMonitor(text, risks) {
 function monitorMessages() {
   if (!siteConfig) return;
 
+  if (chatObserver) {
+    chatObserver.disconnect();
+  }
+
   const chatSelector = siteConfig.chat;
 
   // Observe new messages
@@ -159,6 +168,8 @@ function monitorMessages() {
     subtree: true,
   });
 
+  chatObserver = observer;
+
   // Also check existing messages
   document.querySelectorAll(chatSelector).forEach((msgElement) => {
     const text = msgElement.textContent || msgElement.innerText;
@@ -176,41 +187,41 @@ function monitorMessages() {
  */
 function monitorInput() {
   if (!siteConfig) {
-    console.log("SafetyPin: No site config, skipping input monitoring");
+    console.log("SafeNest: No site config, skipping input monitoring");
     return;
   }
 
   const inputSelector = siteConfig.input;
-  console.log("SafetyPin: Looking for inputs with selector:", inputSelector);
+  console.log("SafeNest: Looking for inputs with selector:", inputSelector);
 
   // Find input fields
   const checkInputs = () => {
     const inputs = document.querySelectorAll(inputSelector);
-    console.log("SafetyPin: Found inputs:", inputs.length, inputs);
+    console.log("SafeNest: Found inputs:", inputs.length, inputs);
 
     inputs.forEach((input, index) => {
-      console.log("SafetyPin attached:", input.dataset.monitorAttached);
+      console.log("SafeNest attached:", input.dataset.monitorAttached);
 
       if (input.dataset.monitorAttached) return;
       input.dataset.monitorAttached = "true";
 
-      console.log("SafetyPin: Attaching listeners to input", index);
+      console.log("SafeNest: Attaching listeners to input", index);
 
       // Monitor input/paste events
       ["input", "paste", "keyup", "textInput"].forEach((eventType) => {
         input.addEventListener(
           eventType,
           (e) => {
-            console.log("SafetyPin: Event detected:", eventType);
+            console.log("SafeNest: Event detected:", eventType);
             setTimeout(() => {
               // For contenteditable, use textContent or innerText
               const text =
                 input.textContent || input.innerText || input.value || "";
-              console.log("SafetyPin: Current text:", text);
+              console.log("SafeNest: Current text:", text);
 
               if (text && text.trim()) {
                 const risks = analyzeText(text);
-                console.log("SafetyPin: Risks found:", risks);
+                console.log("SafeNest: Risks found:", risks);
 
                 if (risks.length > 0 && risks.some((r) => r.level === "high")) {
                   // Warn user before sending
@@ -227,12 +238,12 @@ function monitorInput() {
       const form = input.closest("form");
       if (form && !form.dataset.monitorAttached) {
         form.dataset.monitorAttached = "true";
-        console.log("SafetyPin: Attaching form listener");
+        console.log("SafeNest: Attaching form listener");
         form.addEventListener(
           "submit",
           (e) => {
             const text = input.textContent || input.value;
-            console.log("SafetyPin: Form submit, text:", text);
+            console.log("SafeNest: Form submit, text:", text);
             if (text && text.trim()) {
               const risks = analyzeText(text);
 
@@ -253,7 +264,10 @@ function monitorInput() {
 
   // Check initially and on mutations
   checkInputs();
-  setInterval(checkInputs, 2000);
+
+  if (!inputMonitorIntervalId) {
+    inputMonitorIntervalId = setInterval(checkInputs, 2000);
+  }
 }
 
 /**
@@ -345,7 +359,7 @@ function showBlockedMessage(inputElement) {
  */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log("Content script received message:", request.type, request);
-  
+
   if (request.type === "block_content") {
     console.log("Blocking content:", request.reason);
     
@@ -356,6 +370,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     
     sendResponse({ received: true, blocked: true });
+    return true;
   }
   
   if (request.type === "remove_bad_images") {
@@ -370,6 +385,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     
     sendResponse({ received: true, blocked: true });
+    return true;
   }
   
   if (request.type === "remove_bad_text") {
@@ -384,24 +400,41 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
     
     sendResponse({ received: true, blocked: true });
+    return true;
   }
   
   if (request.type === "analyze_page_dom") {
     console.log("Analyzing page DOM...");
-    
-    // Get the full HTML
-    const html = document.documentElement.outerHTML;
+
+    const parseSrcsetUrls = (srcset) => {
+      if (!srcset || typeof srcset !== 'string') return [];
+      return srcset
+        .split(',')
+        .map((part) => part.trim().split(' ')[0])
+        .filter(Boolean);
+    };
     
     // Get all images with their current URLs and positions
     const images = [];
-    const allImgElements = document.querySelectorAll('img, video[poster], [data-src], [data-lazy-src]');
+    const allImgElements = document.querySelectorAll('img, video[poster], [data-src], [data-lazy-src], source[srcset], picture source[srcset], img[data-srcset]');
     allImgElements.forEach((img, idx) => {
-      const src = img.src || img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || img.poster || '';
-      if (src && !src.startsWith('data:') && !src.includes('chrome-extension')) {
+      const candidateSrcs = [
+        img.src,
+        img.currentSrc,
+        img.getAttribute('data-src'),
+        img.getAttribute('data-lazy-src'),
+        img.poster,
+        ...parseSrcsetUrls(img.getAttribute('srcset')),
+        ...parseSrcsetUrls(img.getAttribute('data-srcset')),
+      ].filter(Boolean);
+
+      const width = img.naturalWidth || img.width || 0;
+      const height = img.naturalHeight || img.height || 0;
+
+      candidateSrcs.forEach((src) => {
+        if (!src || src.startsWith('data:') || src.includes('chrome-extension')) return;
+
         // Skip small images/icons - check naturalWidth and naturalHeight if available
-        const width = img.naturalWidth || img.width || 0;
-        const height = img.naturalHeight || img.height || 0;
-        
         // Skip icons and small images (less than 100x100)
         if (width > 100 || height > 100) {
           images.push({
@@ -415,11 +448,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             height: height,
           });
         }
-      }
+      });
     });
     
     // Get text content from main elements
-    const textSelectors = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'span', 'div', 'a', 'li', 'td', 'th'];
+    const textSelectors = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'a', 'li', 'td', 'th'];
     const textElements = [];
     textSelectors.forEach(selector => {
       document.querySelectorAll(selector).forEach((el, idx) => {
@@ -437,7 +470,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     
     const domData = {
       url: window.location.href,
-      html: html,
+      html: "",
       images: images,
       textElements: textElements,
     };
@@ -453,84 +486,123 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     console.log("Bad text count:", request.badText?.length);
     
     let removedCount = 0;
+    const imageAction = request.imageAction || "remove";
+    const replacementImage = request.replacementImage || chrome.runtime.getURL("assets/images/stop.png");
     
     // For images, try multiple methods to find and remove them
     if (request.badImages && request.badImages.length > 0) {
+      // Normalize URL for comparison
+      const normalizeUrl = (url) => {
+        try {
+          const urlObj = new URL(url);
+          return urlObj.pathname + urlObj.search;
+        } catch {
+          return url;
+        }
+      };
+
+      // Build one-time media index to avoid repeated full-page scans for each bad image
+      const allImages = Array.from(document.querySelectorAll('img, video, [data-src], [data-lazy-src], source[srcset]'));
+      const exactUrlMap = new Map();
+      const pathMap = new Map();
+      const filenameMap = new Map();
+
+      const addToMap = (map, key, element) => {
+        if (!key) return;
+        const normalizedKey = key.toString().trim();
+        if (!normalizedKey) return;
+        const existing = map.get(normalizedKey);
+        if (existing) {
+          existing.push(element);
+        } else {
+          map.set(normalizedKey, [element]);
+        }
+      };
+
+      allImages.forEach((img) => {
+        const srcs = [
+          img.src,
+          img.currentSrc,
+          img.getAttribute('data-src'),
+          img.getAttribute('data-lazy-src'),
+          img.getAttribute('data-srcset')?.split(' ')[0],
+          img.poster,
+          img.querySelector?.('source[src]')?.src,
+        ].filter(Boolean);
+
+        srcs.forEach((src) => {
+          addToMap(exactUrlMap, src, img);
+
+          try {
+            const srcPath = normalizeUrl(src);
+            addToMap(pathMap, srcPath, img);
+          } catch {}
+
+          const filename = src.split('/').pop()?.split('?')[0];
+          if (filename && filename.length > 5) {
+            addToMap(filenameMap, filename, img);
+          }
+        });
+      });
+
       request.badImages.forEach((element, idx) => {
         const imageUrl = element.url;
+        const imageIdx = typeof element.idx === 'number' ? element.idx : -1;
         const elementInfo = element.element_info || {};
         const cssSelector = elementInfo.css_selector;
         const tag = elementInfo.tag || 'img';
         
         console.log(`Processing bad image ${idx}: ${imageUrl}`);
-        
-        // Normalize URL for comparison
-        const normalizeUrl = (url) => {
-          try {
-            const urlObj = new URL(url);
-            return urlObj.pathname + urlObj.search;
-          } catch {
-            return url;
-          }
-        };
-        
+                
         const serverPath = normalizeUrl(imageUrl);
-        const serverHostname = new URL(imageUrl).hostname;
-        
-        // Find all potential image elements
-        const allImages = document.querySelectorAll('img, video, [data-src], [data-lazy-src], source[srcset]');
         
         let found = false;
-        
-        for (const img of allImages) {
-          // Check various src attributes
-          const srcs = [
-            img.src,
-            img.currentSrc,
-            img.getAttribute('data-src'),
-            img.getAttribute('data-lazy-src'),
-            img.getAttribute('data-srcset')?.split(' ')[0],
-            img.poster,
-            img.querySelector?.('source[src]')?.src,
-          ].filter(Boolean);
-          
-          for (const src of srcs) {
-            if (!src) continue;
-            
-            // Try exact match
-            if (src === imageUrl || src.includes(imageUrl)) {
-              console.log(`Found image by partial URL: ${src}`);
-              hideElement(img);
-              removedCount++;
-              found = true;
-              break;
+
+        // Fast exact element index match from dom_analysis capture
+        if (!found && imageIdx >= 0 && imageIdx < allImages.length) {
+          const indexedEl = allImages[imageIdx];
+          if (indexedEl) {
+            console.log(`Found image by index: ${imageIdx}`);
+            if (imageAction === "replace_with_warning") {
+              replaceWithWarningImage(indexedEl, replacementImage);
+            } else {
+              removeUnsafeMediaElement(indexedEl);
             }
-            
-            // Try normalized path match
-            try {
-              const srcPath = normalizeUrl(src);
-              if (srcPath === serverPath || serverPath.includes(srcPath) || srcPath.includes(serverPath)) {
-                console.log(`Found image by path: ${src}`);
-                hideElement(img);
-                removedCount++;
-                found = true;
-                break;
-              }
-            } catch {}
-            
-            // Try filename match
-            const serverFilename = imageUrl.split('/').pop()?.split('?')[0];
-            const srcFilename = src.split('/').pop()?.split('?')[0];
-            if (serverFilename && srcFilename && serverFilename === srcFilename && serverFilename.length > 5) {
-              console.log(`Found image by filename: ${src}`);
-              hideElement(img);
-              removedCount++;
-              found = true;
-              break;
-            }
+            removedCount++;
+            found = true;
           }
-          
-          if (found) break;
+        }
+
+        const hideCandidates = (candidates, reason) => {
+          if (!candidates || candidates.length === 0) return false;
+          candidates.forEach((candidate) => {
+            console.log(`Found image by ${reason}`);
+            if (imageAction === "replace_with_warning") {
+              replaceWithWarningImage(candidate, replacementImage);
+            } else {
+              removeUnsafeMediaElement(candidate);
+            }
+            removedCount++;
+          });
+          return true;
+        };
+
+        // Fast exact URL match
+        if (!found) {
+          found = hideCandidates(exactUrlMap.get(imageUrl), `exact URL: ${imageUrl}`);
+        }
+
+        // Fast path match
+        if (!found) {
+          found = hideCandidates(pathMap.get(serverPath), `path: ${serverPath}`);
+        }
+
+        // Fast filename match
+        if (!found) {
+          const serverFilename = imageUrl.split('/').pop()?.split('?')[0];
+          if (serverFilename && serverFilename.length > 5) {
+            found = hideCandidates(filenameMap.get(serverFilename), `filename: ${serverFilename}`);
+          }
         }
         
         // Try CSS selector if provided and not just a generic tag
@@ -539,7 +611,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             const els = document.querySelectorAll(cssSelector);
             for (const el of els) {
               console.log(`Found image by CSS: ${cssSelector}`);
-              hideElement(el);
+              if (imageAction === "replace_with_warning") {
+                replaceWithWarningImage(el, replacementImage);
+              } else {
+                removeUnsafeMediaElement(el);
+              }
               removedCount++;
               found = true;
             }
@@ -556,7 +632,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
             const el = document.getElementById(elId);
             if (el && (el.tagName === 'IMG' || el.tagName === 'VIDEO')) {
               console.log(`Found image by ID: ${elId}`);
-              hideElement(el);
+              if (imageAction === "replace_with_warning") {
+                replaceWithWarningImage(el, replacementImage);
+              } else {
+                removeUnsafeMediaElement(el);
+              }
               removedCount++;
               found = true;
             }
@@ -569,7 +649,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               const els = document.querySelectorAll(`${tag}.${cls}`);
               for (const el of els) {
                 console.log(`Found image by class: ${cls}`);
-                hideElement(el);
+                if (imageAction === "replace_with_warning") {
+                  replaceWithWarningImage(el, replacementImage);
+                } else {
+                  removeUnsafeMediaElement(el);
+                }
                 removedCount++;
                 found = true;
               }
@@ -675,6 +759,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     
     console.log(`Total removed: ${removedCount}`);
     sendResponse({ received: true, blocked: true, removed: removedCount });
+    return true;
   }
 
   sendResponse({ received: true });
@@ -690,6 +775,59 @@ function hideElement(element) {
   element.style.visibility = 'hidden';
   element.style.opacity = '0';
   element.setAttribute('data-safety-blocked', 'true');
+}
+
+function removeUnsafeMediaElement(element) {
+  if (!element) return;
+
+  hideElement(element);
+
+  const wrapperLink = element.closest && element.closest('a');
+  if (!wrapperLink) return;
+
+  const wrapperText = (wrapperLink.textContent || '').trim();
+  const mediaChildren = wrapperLink.querySelectorAll('img, video, picture, source').length;
+
+  if (!wrapperText || mediaChildren > 0) {
+    wrapperLink.style.pointerEvents = 'none';
+    wrapperLink.style.cursor = 'default';
+    wrapperLink.removeAttribute('href');
+    wrapperLink.setAttribute('data-safety-blocked', 'true');
+  }
+}
+
+function replaceWithWarningImage(element, warningImageUrl) {
+  if (!element) return;
+
+  const tag = (element.tagName || '').toLowerCase();
+  element.setAttribute('data-safety-blocked', 'true');
+
+  if (tag === 'img') {
+    element.dataset.safetyOriginalSrc = element.src || '';
+    element.src = warningImageUrl;
+    element.srcset = '';
+    element.style.filter = 'blur(4px)';
+    element.style.objectFit = 'cover';
+    element.alt = 'Blocked unsafe image';
+    return;
+  }
+
+  if (tag === 'video') {
+    if (typeof element.pause === 'function') {
+      element.pause();
+    }
+    element.poster = warningImageUrl;
+    element.style.filter = 'blur(4px)';
+    return;
+  }
+
+  element.style.backgroundImage = `url('${warningImageUrl}')`;
+  element.style.backgroundSize = 'cover';
+  element.style.backgroundPosition = 'center';
+  element.style.filter = 'blur(4px)';
+  if (!element.style.minHeight) {
+    element.style.minHeight = '120px';
+  }
 }
 
 /**
@@ -745,8 +883,13 @@ new MutationObserver(() => {
   const url = location.href;
   if (url !== lastUrl) {
     lastUrl = url;
-    console.log("SafetyPin: URL changed, reinitializing...");
-    setTimeout(() => {
+    console.log("SafeNest: URL changed, reinitializing...");
+
+    if (reinitTimeoutId) {
+      clearTimeout(reinitTimeoutId);
+    }
+
+    reinitTimeoutId = setTimeout(() => {
       monitorMessages();
       monitorInput();
     }, 1000);

@@ -1,13 +1,16 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
 using Microsoft.ML;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
@@ -22,6 +25,8 @@ public class Program
 {
     private const int MaxMessageSize = 1024 * 1024; // 1MB
     private const int MaxTextLength = 256;
+    private const int DomImageParallelism = 4;
+    private const double LowReputationSafetyThreshold = 0.70;
     
     private static InferenceSession? _imageSession;
     private static InferenceSession? _textSession;
@@ -44,12 +49,17 @@ public class Program
         Timeout = TimeSpan.FromSeconds(10)
     };
 
+    private static readonly object _dbLock = new object();
+    private static string _sqliteDbPath = string.Empty;
+
     public static int Main(string[] args)
     {
+        AppLogger.Initialize();
         Console.Error.WriteLine("[INFO] C# Native Messaging Host starting...");
 
         try
         {
+            EnsureDatabaseInitialized();
             LoadModels();
             
             if (args.Length > 0 && args[0] == "--install")
@@ -65,6 +75,10 @@ public class Program
         {
             Console.Error.WriteLine($"[ERROR] Fatal error: {ex.Message}");
             return 1;
+        }
+        finally
+        {
+            AppLogger.Shutdown();
         }
     }
 
@@ -255,6 +269,10 @@ public class Program
                 var errorResponse = FormatError("internal_error", ex.Message);
                 try { SendMessage(stdout, errorResponse); } catch { }
             }
+            finally
+            {
+                AppLogger.ClearRequestScope();
+            }
         }
 
         Console.Error.WriteLine("[INFO] Native messaging host stopped");
@@ -298,7 +316,6 @@ public class Program
             totalRead += read;
         }
 
-        Console.Error.WriteLine($"[DEBUG] Received message: {messageLength} bytes");
         return message;
     }
 
@@ -317,9 +334,11 @@ public class Program
 
     private static byte[] HandleMessage(byte[] messageJson)
     {
+        var messageStopwatch = Stopwatch.StartNew();
         var message = Encoding.UTF8.GetString(messageJson);
+        Console.Error.WriteLine($"[TRACE] Received message JSON preview: {TruncateForLog(message, 300)}");
         
-        JsonDocument doc;
+        JsonDocument? doc = null;
         JsonElement root;
         double? messageId = null;
         
@@ -369,34 +388,54 @@ public class Program
             root = dataElement2;
         }
 
-        if (!root.TryGetProperty("type", out var typeElement2))
+        var msgType = "unknown";
+        if (root.TryGetProperty("type", out var typeElement2))
         {
+            msgType = typeElement2.GetString() ?? "unknown";
+        }
+
+        var requestScopeId = BuildRequestScopeId(messageId, msgType);
+        AppLogger.SetRequestScope(requestScopeId);
+        Console.Error.WriteLine($"[DEBUG] Received message: {messageJson.Length} bytes");
+
+        if (msgType == "unknown")
+        {
+            Console.Error.WriteLine("[WARNING] Missing 'type' field in incoming message");
             return FormatError("missing_field", "Missing 'type' field", messageId);
         }
 
-        var msgType = typeElement2.GetString() ?? "";
         Console.Error.WriteLine($"[DEBUG] Message type: {msgType}, messageId: {messageId}");
 
         try
         {
-            return msgType switch
+            var responseBytes = msgType switch
             {
                 "content_analysis" => HandleContentAnalysis(root),
                 "url_analysis" => HandleUrlAnalysis(root),
                 "dom_analysis" => HandleDomAnalysis(root),
                 "heartbeat" => HandleHeartbeat(),
                 "get_status" => HandleGetStatus(),
+                "get_user_info" => HandleGetUserInfo(),
+                "get_low_reputation_history" => HandleGetLowReputationHistory(root),
+                "save_user_info" => HandleSaveUserInfo(root),
                 "classify_text" => HandleClassifyText(root),
                 "classify_image" => HandleClassifyImage(root),
                 "classify_both" => HandleClassifyBoth(root),
                 _ => FormatError("unknown_type", msgType, messageId)
             };
+
+            Console.Error.WriteLine($"[DEBUG] Message handled: type={msgType}, elapsed_ms={messageStopwatch.ElapsedMilliseconds}, response_bytes={responseBytes.Length}");
+            return responseBytes;
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[ERROR] Handle message error: {ex.Message}");
             Console.Error.WriteLine($"[ERROR] Stack trace: {ex.StackTrace}");
             return FormatError("handler_error", ex.Message, messageId);
+        }
+        finally
+        {
+            doc?.Dispose();
         }
     }
 
@@ -516,15 +555,11 @@ public class Program
             // Check domain reputation
             string reputation = "unknown";
             bool inDatabase = false;
-            double riskScore = 0.5;
-            
-            if (_domainReputation.Count > 0)
+            double riskScore = ClassifyDomain(domain);
+
+            if (_domainReputation.Count > 0 && TryGetDomainReputation(domain, out reputation))
             {
-                if (TryGetDomainReputation(domain, out reputation))
-                {
-                    inDatabase = true;
-                    riskScore = reputation == "phishing" ? 0.9 : (reputation == "legitimate" ? 0.1 : 0.5);
-                }
+                inDatabase = true;
             }
 
             string htmlContent = "";
@@ -733,14 +768,14 @@ public class Program
 
                         try
                         {
-                            var imgRequest = new HttpRequestMessage(HttpMethod.Get, imgUrl);
+                            using var imgRequest = new HttpRequestMessage(HttpMethod.Get, imgUrl);
                             imgRequest.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-                            var imgResponse = _httpClient.Send(imgRequest);
+                            using var imgResponse = _httpClient.Send(imgRequest);
                             if (imgResponse.IsSuccessStatusCode)
                             {
-                                var imgBytes = imgResponse.Content.ReadAsByteArrayAsync().Result;
+                                var imgBytes = imgResponse.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
                                 var contentType = imgResponse.Content.Headers.ContentType?.MediaType ?? "unknown";
-                                var imgResult = ClassifyImage(Convert.ToBase64String(imgBytes));
+                                var imgResult = ClassifyImage(imgBytes);
                                 
                                 var elementInfo = GetElementInfo(imgNode);
                                 
@@ -837,6 +872,15 @@ public class Program
             if (requestId.HasValue)
                 response["requestId"] = requestId.Value;
 
+            RecordLowReputationVisitIfNeeded(
+                url,
+                domain,
+                riskScore,
+                "url_analysis",
+                finalClassification,
+                finalReasons,
+                finalClassification == "bad" ? "page_blocked" : "content_removed");
+
             return SerializeResponse(response);
         }
         catch (Exception ex)
@@ -848,6 +892,7 @@ public class Program
 
     private static byte[] HandleDomAnalysis(JsonElement root)
     {
+        var domStopwatch = Stopwatch.StartNew();
         string? url = null;
         string? html = null;
         List<object>? images = null;
@@ -911,6 +956,7 @@ public class Program
 
             bool foundBad = false;
             double highestConfidence = 0.0;
+            var textAnalysisStopwatch = Stopwatch.StartNew();
 
             var textAnalysis = new Dictionary<string, object>
             {
@@ -920,11 +966,9 @@ public class Program
             };
 
             var textElementResults = new List<object>();
-            var limitedTextElements = textElements?.Take(30).ToList();
-
-            if (limitedTextElements != null && _textSession != null)
+            if (textElements != null && _textSession != null)
             {
-                foreach (var te in limitedTextElements)
+                foreach (var te in textElements)
                 {
                     var teDict = (Dictionary<string, object>)te;
                     var text = teDict["text"]?.ToString() ?? "";
@@ -974,6 +1018,9 @@ public class Program
                 }
                 Console.Error.WriteLine($"[INFO] Text analysis done. Bad elements: {textElementResults.Count}");
             }
+
+            textAnalysisStopwatch.Stop();
+            Console.Error.WriteLine($"[DEBUG] Text analysis duration_ms={textAnalysisStopwatch.ElapsedMilliseconds}");
 
             // Get domain risk score BEFORE the early return check
             double domainRiskForText = 0.5;
@@ -1035,13 +1082,16 @@ public class Program
             };
 
             var badImageElements = new List<object>();
+            double maxBadImageConfidence = 0.0;
+            var imageAnalysisStopwatch = Stopwatch.StartNew();
 
             if (images != null && _imageSession != null)
             {
-                var imageList = images.ToList();
                 int analyzedCount = 0;
+                var processedImageUrls = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var uniqueImageDicts = new List<Dictionary<string, object>>();
 
-                foreach (var imgInfo in imageList)
+                foreach (var imgInfo in images)
                 {
                     var imgDict = (Dictionary<string, object>)imgInfo;
                     var imgUrl = imgDict["src"]?.ToString() ?? "";
@@ -1049,25 +1099,54 @@ public class Program
                     if (string.IsNullOrEmpty(imgUrl) || imgUrl.StartsWith("data:"))
                         continue;
 
-                    analyzedCount++;
+                    if (!processedImageUrls.Add(imgUrl))
+                        continue;
 
-                    try
+                    uniqueImageDicts.Add(imgDict);
+                }
+
+                Console.Error.WriteLine($"[DEBUG] DOM image analysis: unique_images={uniqueImageDicts.Count}, parallelism={DomImageParallelism}");
+
+                var badImageBag = new ConcurrentBag<object>();
+                var confidenceLock = new object();
+                var parallelOptions = new ParallelOptions
+                {
+                    MaxDegreeOfParallelism = DomImageParallelism
+                };
+
+                try
+                {
+                    Parallel.ForEach(uniqueImageDicts, parallelOptions, (imgDict) =>
                     {
-                        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-                        var imgRequest = new HttpRequestMessage(HttpMethod.Get, imgUrl);
-                        imgRequest.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
-                        var imgResponse = _httpClient.Send(imgRequest, cts.Token);
-                        
-                        if (imgResponse.IsSuccessStatusCode)
-                        {
-                            var imgBytes = imgResponse.Content.ReadAsByteArrayAsync(cts.Token).Result;
-                            var imgResult = ClassifyImage(Convert.ToBase64String(imgBytes));
+                        var imgUrl = imgDict["src"]?.ToString() ?? "";
+                        if (string.IsNullOrEmpty(imgUrl))
+                            return;
 
-                            if (imgResult.Classification == "bad" && imgResult.Confidence > 0.85)
+                        Interlocked.Increment(ref analyzedCount);
+
+                        try
+                        {
+                            using var perImageCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                            perImageCts.CancelAfter(TimeSpan.FromSeconds(2));
+
+                            using var imgRequest = new HttpRequestMessage(HttpMethod.Get, imgUrl);
+                            imgRequest.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+                            using var imgResponse = _httpClient.Send(imgRequest, perImageCts.Token);
+
+                            if (!imgResponse.IsSuccessStatusCode)
+                                return;
+
+                            var imgBytes = imgResponse.Content.ReadAsByteArrayAsync(perImageCts.Token).GetAwaiter().GetResult();
+                            var imgResult = ClassifyImage(imgBytes);
+
+                            Console.Error.WriteLine($"[INFO] Image classified: {imgUrl} -> {imgResult.Classification}");
+
+                            if (imgResult.Classification == "bad")
                             {
-                                badImageElements.Add(new Dictionary<string, object>
+                                badImageBag.Add(new Dictionary<string, object>
                                 {
                                     ["url"] = imgUrl,
+                                    ["idx"] = imgDict.ContainsKey("idx") ? imgDict["idx"] : -1,
                                     ["confidence"] = imgResult.Confidence,
                                     ["classification"] = imgResult.Classification,
                                     ["element_info"] = new Dictionary<string, object>
@@ -1079,46 +1158,28 @@ public class Program
                                     }
                                 });
 
-                                Console.Error.WriteLine($"[INFO] Bad image found ({imgResult.Confidence:P0}), returning early");
-
-                                imageAnalysis["has_harmful_images"] = true;
-                                imageAnalysis["images_analyzed"] = analyzedCount;
-                                imageAnalysis["bad_images"] = badImageElements.Count;
-                                imageAnalysis["good_images"] = analyzedCount - badImageElements.Count;
-                                imageAnalysis["bad_image_elements"] = badImageElements;
-
-                                // Return immediately when bad image found with > 85% confidence - always block for harmful images
-                                var earlyResponse = new Dictionary<string, object>
+                                lock (confidenceLock)
                                 {
-                                    ["page_classification"] = "bad",
-                                    ["page_confidence"] = imgResult.Confidence,
-                                    ["page_reasons"] = new[] { "harmful_images_detected" },
-                                    ["action_taken"] = "page_blocked",
-                                    ["text_analysis"] = textAnalysis,
-                                    ["image_analysis"] = imageAnalysis,
-                                    ["domain_analysis"] = new Dictionary<string, object>
+                                    if (imgResult.Confidence > maxBadImageConfidence)
                                     {
-                                        ["domain"] = !string.IsNullOrEmpty(url) ? new Uri(url).Host : "",
-                                        ["risk_score"] = 0.5,
-                                        ["category"] = "unknown",
-                                        ["in_database"] = false
-                                    },
-                                    ["type"] = "dom",
-                                    ["requested_url"] = url ?? "",
-                                    ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
-                                };
-
-                                if (requestId.HasValue)
-                                    earlyResponse["requestId"] = requestId.Value;
-
-                                return SerializeResponse(earlyResponse);
+                                        maxBadImageConfidence = imgResult.Confidence;
+                                    }
+                                }
                             }
-
-                            Console.Error.WriteLine($"[INFO] Image classified: {imgUrl} -> {imgResult.Classification}");
                         }
-                    }
-                    catch { }
+                        catch (OperationCanceledException)
+                        {
+                        }
+                        catch
+                        {
+                        }
+                    });
                 }
+                catch (OperationCanceledException)
+                {
+                }
+
+                badImageElements.AddRange(badImageBag.Cast<object>());
 
                 imageAnalysis["has_harmful_images"] = badImageElements.Count > 0;
                 imageAnalysis["images_analyzed"] = analyzedCount;
@@ -1126,6 +1187,9 @@ public class Program
                 imageAnalysis["good_images"] = analyzedCount - badImageElements.Count;
                 imageAnalysis["bad_image_elements"] = badImageElements;
             }
+
+            imageAnalysisStopwatch.Stop();
+            Console.Error.WriteLine($"[DEBUG] Image analysis duration_ms={imageAnalysisStopwatch.ElapsedMilliseconds}, images_analyzed={imageAnalysis["images_analyzed"]}");
 
             var finalClassification = "good";
             var finalConfidence = 0.5;
@@ -1174,28 +1238,37 @@ public class Program
             // If domain is high risk, skip content analysis and block immediately
             if (!shouldBlockEntirePage)
             {
-                // For high reputation domains, only mark as bad if harmful images detected
-                // For text false positives, just remove content (don't block page)
+                // Harmful images always mark page as bad; multiple harmful images escalate to full-page block.
                 if (badImageElements.Count > 0)
                 {
+                    finalClassification = "bad";
+                    finalConfidence = Math.Max(finalConfidence, maxBadImageConfidence > 0 ? maxBadImageConfidence : finalConfidence);
                     finalReasons.Add("harmful_images_detected");
                 }
-                
-                // Only block page if domain is high risk OR harmful images found
-                // For text false positives on high reputation domains, just remove content
-                if (textElementResults.Count > 0 && domainRiskScore >= 0.9)
+
+                if (badImageElements.Count > 1)
                 {
-                    finalReasons.Add("harmful_text_detected");
-                }
-                else if (textElementResults.Count > 0)
-                {
-                    // High reputation domain with text issue - just note it, don't block
-                    Console.Error.WriteLine($"[INFO] Text false positive on high-reputation domain {domainStr}, removing content only");
+                    shouldBlockEntirePage = true;
+                    finalClassification = "bad";
+                    finalConfidence = Math.Max(finalConfidence, maxBadImageConfidence > 0 ? maxBadImageConfidence : 0.9);
+                    finalReasons.Add("multiple_harmful_images_detected");
                 }
 
-                // For non-blocked pages, confidence should reflect "good" confidence,
-                // which is the inverse of domain risk instead of the default 0.5 fallback.
-                finalConfidence = Math.Clamp(1.0 - domainRiskScore, 0.0, 1.0);
+                // Harmful text should block the page.
+                if (textElementResults.Count > 0)
+                {
+                    shouldBlockEntirePage = true;
+                    finalClassification = "bad";
+                    finalConfidence = Math.Max(finalConfidence, highestConfidence > 0 ? highestConfidence : 0.9);
+                    finalReasons.Add("harmful_text_detected");
+                }
+
+                if (!shouldBlockEntirePage)
+                {
+                    // For non-blocked pages, confidence should reflect "good" confidence,
+                    // which is the inverse of domain risk instead of the default 0.5 fallback.
+                    finalConfidence = Math.Clamp(1.0 - domainRiskScore, 0.0, 1.0);
+                }
             }
 
             if (textAnalysis.TryGetValue("classification", out var textClassificationObj)
@@ -1223,7 +1296,7 @@ public class Program
                 ["page_classification"] = finalClassification,
                 ["page_confidence"] = finalConfidence,
                 ["page_reasons"] = finalReasons.ToArray(),
-                ["action_taken"] = (shouldBlockEntirePage || finalReasons.Contains("harmful_images_detected")) ? "page_blocked" : "content_removed",
+                ["action_taken"] = shouldBlockEntirePage ? "page_blocked" : "content_removed",
                 ["text_analysis"] = textAnalysis,
                 ["image_analysis"] = imageAnalysis,
                 ["domain_analysis"] = new Dictionary<string, object>
@@ -1241,13 +1314,48 @@ public class Program
             if (requestId.HasValue)
                 response["requestId"] = requestId.Value;
 
+            RecordLowReputationVisitIfNeeded(
+                url,
+                domainStr,
+                domainRiskScore,
+                "dom_analysis",
+                finalClassification,
+                finalReasons,
+                shouldBlockEntirePage ? "page_blocked" : "content_removed");
+
+            domStopwatch.Stop();
+            Console.Error.WriteLine($"[INFO] DOM analysis completed in {domStopwatch.ElapsedMilliseconds} ms for url={url}");
+
             return SerializeResponse(response);
         }
         catch (Exception ex)
         {
+            domStopwatch.Stop();
+            Console.Error.WriteLine($"[ERROR] DOM analysis failed after {domStopwatch.ElapsedMilliseconds} ms");
             Console.Error.WriteLine($"[ERROR] DOM analysis error: {ex.Message}");
             return FormatError("dom_analysis_error", ex.Message);
         }
+    }
+
+    private static string TruncateForLog(string? value, int maxLength)
+    {
+        if (string.IsNullOrEmpty(value))
+            return string.Empty;
+
+        return value.Length <= maxLength
+            ? value
+            : value.Substring(0, maxLength) + "...";
+    }
+
+    private static string BuildRequestScopeId(double? messageId, string messageType)
+    {
+        var normalizedType = string.IsNullOrWhiteSpace(messageType) ? "unknown" : messageType;
+        if (messageId.HasValue)
+        {
+            return $"{normalizedType}:{messageId.Value:0.############}";
+        }
+
+        return $"{normalizedType}:{Guid.NewGuid().ToString("N").Substring(0, 8)}";
     }
 
     private static string BuildCssSelector(string tag, string id, string cls)
@@ -1411,6 +1519,317 @@ public class Program
         return Encoding.UTF8.GetBytes(json);
     }
 
+    private static byte[] HandleSaveUserInfo(JsonElement root)
+    {
+        var email = root.TryGetProperty("email", out var emailElement)
+            ? (emailElement.GetString() ?? string.Empty).Trim()
+            : string.Empty;
+        var phone = root.TryGetProperty("phone", out var phoneElement)
+            ? (phoneElement.GetString() ?? string.Empty).Trim()
+            : string.Empty;
+
+        if (string.IsNullOrWhiteSpace(email) && string.IsNullOrWhiteSpace(phone))
+        {
+            return FormatError("invalid_user_info", "At least one contact value is required");
+        }
+
+        try
+        {
+            SaveUserInfo(email, phone);
+
+            var response = new Dictionary<string, object>
+            {
+                ["action"] = "user_info_saved",
+                ["saved"] = true,
+                ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            };
+
+            return SerializeResponse(response);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ERROR] Failed to save user info: {ex.Message}");
+            return FormatError("save_user_info_failed", ex.Message);
+        }
+    }
+
+    private static byte[] HandleGetUserInfo()
+    {
+        try
+        {
+            var userInfo = GetUserInfo();
+
+            var response = new Dictionary<string, object>
+            {
+                ["action"] = "user_info",
+                ["email"] = userInfo.email,
+                ["phone"] = userInfo.phone,
+                ["updated_at"] = userInfo.updatedAt,
+                ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            };
+
+            return SerializeResponse(response);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ERROR] Failed to get user info: {ex.Message}");
+            return FormatError("get_user_info_failed", ex.Message);
+        }
+    }
+
+    private static byte[] HandleGetLowReputationHistory(JsonElement root)
+    {
+        try
+        {
+            var limit = 50;
+            if (root.TryGetProperty("limit", out var limitElement))
+            {
+                try
+                {
+                    var requestedLimit = limitElement.GetInt32();
+                    if (requestedLimit > 0)
+                        limit = Math.Min(requestedLimit, 200);
+                }
+                catch
+                {
+                }
+            }
+
+            var visits = GetLowReputationVisits(limit);
+
+            var response = new Dictionary<string, object>
+            {
+                ["action"] = "low_reputation_history",
+                ["count"] = visits.Count,
+                ["items"] = visits,
+                ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+            };
+
+            return SerializeResponse(response);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ERROR] Failed to get low-reputation history: {ex.Message}");
+            return FormatError("get_low_reputation_history_failed", ex.Message);
+        }
+    }
+
+    private static void EnsureDatabaseInitialized()
+    {
+        var appDataDir = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        var dbDir = Path.Combine(appDataDir, "SafetyPin");
+        Directory.CreateDirectory(dbDir);
+
+        _sqliteDbPath = Path.Combine(dbDir, "safetypin.db");
+
+        lock (_dbLock)
+        {
+            using var connection = new SqliteConnection($"Data Source={_sqliteDbPath}");
+            connection.Open();
+
+            using (var command = connection.CreateCommand())
+            {
+                command.CommandText = @"
+CREATE TABLE IF NOT EXISTS user_info (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  email TEXT,
+  phone TEXT,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS low_reputation_visits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  visited_url TEXT NOT NULL,
+  domain TEXT NOT NULL,
+  risk_score REAL NOT NULL,
+  safety_score REAL NOT NULL,
+  analysis_type TEXT NOT NULL,
+  page_classification TEXT NOT NULL,
+    action_taken TEXT,
+    blocked_page_shown INTEGER NOT NULL DEFAULT 0,
+  reasons TEXT,
+  created_at INTEGER NOT NULL
+);";
+                command.ExecuteNonQuery();
+            }
+
+                        try
+                        {
+                                using var migrationCommand = connection.CreateCommand();
+                                migrationCommand.CommandText = "ALTER TABLE low_reputation_visits ADD COLUMN action_taken TEXT;";
+                                migrationCommand.ExecuteNonQuery();
+                        }
+                        catch
+                        {
+                        }
+
+                        try
+                        {
+                                using var migrationCommand = connection.CreateCommand();
+                                migrationCommand.CommandText = "ALTER TABLE low_reputation_visits ADD COLUMN blocked_page_shown INTEGER NOT NULL DEFAULT 0;";
+                                migrationCommand.ExecuteNonQuery();
+                        }
+                        catch
+                        {
+                        }
+        }
+
+        Console.Error.WriteLine($"[INFO] SQLite initialized at {_sqliteDbPath}");
+    }
+
+    private static void SaveUserInfo(string email, string phone)
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        lock (_dbLock)
+        {
+            using var connection = new SqliteConnection($"Data Source={_sqliteDbPath}");
+            connection.Open();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+INSERT INTO user_info (id, email, phone, updated_at)
+VALUES (1, $email, $phone, $updated_at)
+ON CONFLICT(id) DO UPDATE SET
+  email = excluded.email,
+  phone = excluded.phone,
+  updated_at = excluded.updated_at;";
+            command.Parameters.AddWithValue("$email", string.IsNullOrWhiteSpace(email) ? (object)DBNull.Value : email);
+            command.Parameters.AddWithValue("$phone", string.IsNullOrWhiteSpace(phone) ? (object)DBNull.Value : phone);
+            command.Parameters.AddWithValue("$updated_at", now);
+            command.ExecuteNonQuery();
+        }
+    }
+
+    private static (string email, string phone, long updatedAt) GetUserInfo()
+    {
+        lock (_dbLock)
+        {
+            using var connection = new SqliteConnection($"Data Source={_sqliteDbPath}");
+            connection.Open();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+SELECT email, phone, updated_at
+FROM user_info
+WHERE id = 1
+LIMIT 1;";
+
+            using var reader = command.ExecuteReader();
+            if (!reader.Read())
+            {
+                return (string.Empty, string.Empty, 0);
+            }
+
+            var email = reader.IsDBNull(0) ? string.Empty : reader.GetString(0);
+            var phone = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
+            var updatedAt = reader.IsDBNull(2) ? 0 : reader.GetInt64(2);
+            return (email, phone, updatedAt);
+        }
+    }
+
+    private static List<Dictionary<string, object>> GetLowReputationVisits(int limit)
+    {
+        var results = new List<Dictionary<string, object>>();
+
+        lock (_dbLock)
+        {
+            using var connection = new SqliteConnection($"Data Source={_sqliteDbPath}");
+            connection.Open();
+
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+SELECT visited_url, domain, risk_score, safety_score, analysis_type, page_classification, action_taken, blocked_page_shown, reasons, created_at
+FROM low_reputation_visits
+ORDER BY created_at DESC
+LIMIT $limit;";
+            command.Parameters.AddWithValue("$limit", limit);
+
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                results.Add(new Dictionary<string, object>
+                {
+                    ["visited_url"] = reader.IsDBNull(0) ? string.Empty : reader.GetString(0),
+                    ["domain"] = reader.IsDBNull(1) ? string.Empty : reader.GetString(1),
+                    ["risk_score"] = reader.IsDBNull(2) ? 0.0 : reader.GetDouble(2),
+                    ["safety_score"] = reader.IsDBNull(3) ? 0.0 : reader.GetDouble(3),
+                    ["analysis_type"] = reader.IsDBNull(4) ? string.Empty : reader.GetString(4),
+                    ["page_classification"] = reader.IsDBNull(5) ? string.Empty : reader.GetString(5),
+                    ["action_taken"] = reader.IsDBNull(6) ? string.Empty : reader.GetString(6),
+                    ["blocked_page_shown"] = !reader.IsDBNull(7) && reader.GetInt64(7) == 1,
+                    ["reasons"] = reader.IsDBNull(8) ? string.Empty : reader.GetString(8),
+                    ["created_at"] = reader.IsDBNull(9) ? 0L : reader.GetInt64(9)
+                });
+            }
+        }
+
+        return results;
+    }
+
+    private static void RecordLowReputationVisitIfNeeded(
+        string? visitedUrl,
+        string? domain,
+        double riskScore,
+        string analysisType,
+        string pageClassification,
+        List<string> reasons,
+        string actionTaken)
+    {
+        if (string.IsNullOrWhiteSpace(visitedUrl) || string.IsNullOrWhiteSpace(domain))
+            return;
+
+        if (!Uri.TryCreate(visitedUrl, UriKind.Absolute, out var visitedUri))
+            return;
+
+        var scheme = visitedUri.Scheme;
+        if (!string.Equals(scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        var safetyScore = 1.0 - riskScore;
+        var blockedPageShown = string.Equals(actionTaken, "page_blocked", StringComparison.OrdinalIgnoreCase);
+
+        if (safetyScore >= LowReputationSafetyThreshold && !blockedPageShown)
+            return;
+
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var reasonsText = reasons.Count == 0 ? string.Empty : string.Join(",", reasons.Distinct());
+
+        try
+        {
+            lock (_dbLock)
+            {
+                using var connection = new SqliteConnection($"Data Source={_sqliteDbPath}");
+                connection.Open();
+
+                using var command = connection.CreateCommand();
+                command.CommandText = @"
+INSERT INTO low_reputation_visits
+    (visited_url, domain, risk_score, safety_score, analysis_type, page_classification, action_taken, blocked_page_shown, reasons, created_at)
+VALUES
+    ($visited_url, $domain, $risk_score, $safety_score, $analysis_type, $page_classification, $action_taken, $blocked_page_shown, $reasons, $created_at);";
+                command.Parameters.AddWithValue("$visited_url", visitedUrl);
+                command.Parameters.AddWithValue("$domain", domain);
+                command.Parameters.AddWithValue("$risk_score", riskScore);
+                command.Parameters.AddWithValue("$safety_score", safetyScore);
+                command.Parameters.AddWithValue("$analysis_type", analysisType);
+                command.Parameters.AddWithValue("$page_classification", pageClassification);
+                                command.Parameters.AddWithValue("$action_taken", string.IsNullOrWhiteSpace(actionTaken) ? (object)DBNull.Value : actionTaken);
+                                command.Parameters.AddWithValue("$blocked_page_shown", blockedPageShown ? 1 : 0);
+                command.Parameters.AddWithValue("$reasons", reasonsText);
+                command.Parameters.AddWithValue("$created_at", now);
+                command.ExecuteNonQuery();
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ERROR] Failed to record low-reputation visit: {ex.Message}");
+        }
+    }
+
     private static byte[] FormatError(string errorType, string message, double? messageId = null)
     {
         var response = new Dictionary<string, object>
@@ -1463,7 +1882,7 @@ public class Program
                 NamedOnnxValue.CreateFromTensor("attention_mask", inputAttentionMask)
             };
 
-            var outputs = _textSession!.Run(inputTensors);
+            using var outputs = _textSession!.Run(inputTensors);
             
             var classLogits = outputs[0].AsEnumerable<float>().ToArray();
             var reasonLogits = outputs[1].AsEnumerable<float>().ToArray();
@@ -1509,8 +1928,8 @@ public class Program
             if (TryGetDomainReputation(domain, out var reputation))
             {
                 // If known phishing, return high risk (0.9)
-                // If known legitimate, return high reputation (0.1 = 90% confidence)
-                return reputation == "phishing" ? 0.9 : 0.1;
+                // If known legitimate, return very low risk (0.01 = 99% safety)
+                return reputation == "phishing" ? 0.9 : 0.01;
             }
         }
 
@@ -1523,9 +1942,14 @@ public class Program
                 var inputIds = new long[_domainMaxLength];
                 for (int i = 0; i < _domainMaxLength; i++)
                 {
-                    inputIds[i] = i < domain.Length && _charToIdx.ContainsKey(domain[i]) 
-                        ? _charToIdx[domain[i]] 
-                        : 1; // <UNK>
+                    if (i < domain.Length && _charToIdx.TryGetValue(domain[i], out var mappedIndex))
+                    {
+                        inputIds[i] = mappedIndex;
+                    }
+                    else
+                    {
+                        inputIds[i] = 1; // <UNK>
+                    }
                 }
 
                 var inputTensor = new DenseTensor<long>(inputIds, new[] { 1, _domainMaxLength });
@@ -1534,7 +1958,7 @@ public class Program
                     NamedOnnxValue.CreateFromTensor("input_ids", inputTensor)
                 };
 
-                var outputs = _domainSession.Run(inputs);
+                using var outputs = _domainSession.Run(inputs);
                 var logits = outputs.FirstOrDefault()?.AsEnumerable<float>().ToArray();
                 
                 if (logits != null && logits.Length >= 2)
@@ -1772,8 +2196,6 @@ public class Program
     {
         try
         {
-            byte[] imageBytes;
-            
             if (imageBase64.StartsWith("data:image"))
             {
                 var commaIndex = imageBase64.IndexOf(',');
@@ -1781,7 +2203,25 @@ public class Program
                     imageBase64 = imageBase64.Substring(commaIndex + 1);
             }
 
-            imageBytes = Convert.FromBase64String(imageBase64);
+            var imageBytes = Convert.FromBase64String(imageBase64);
+            return ClassifyImage(imageBytes);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ERROR] Image classification error: {ex.Message}");
+            return new ClassificationResult
+            {
+                Classification = "good",
+                Confidence = 0.5,
+                Reason = "classification_error"
+            };
+        }
+    }
+
+    private static ClassificationResult ClassifyImage(byte[] imageBytes)
+    {
+        try
+        {
 
             using var image = Image.Load<Rgb24>(imageBytes);
             
@@ -1823,7 +2263,7 @@ public class Program
                 NamedOnnxValue.CreateFromTensor("input", inputTensor)
             };
 
-            var outputs = _imageSession!.Run(inputs);
+            using var outputs = _imageSession!.Run(inputs);
             var logits = outputs[0].AsEnumerable<float>().ToArray();
             var probs = Softmax(logits);
 
@@ -2000,5 +2440,300 @@ public class Program
         public string Classification { get; set; } = "good";
         public double Confidence { get; set; } = 0.5;
         public string Reason { get; set; } = "";
+    }
+}
+
+public enum AppLogLevel
+{
+    Trace = 0,
+    Debug = 1,
+    Info = 2,
+    Warning = 3,
+    Error = 4,
+    None = 5
+}
+
+public static class AppLogger
+{
+    private static readonly object Sync = new();
+    private static readonly AsyncLocal<string?> CurrentRequestScope = new();
+    private static StreamWriter? _writer;
+    private static string _logFilePath = string.Empty;
+    private static long _maxFileBytes;
+    private static int _maxRotatedFiles;
+    private static AppLogLevel _minimumLevel;
+    private static TextWriter? _originalErrorWriter;
+    private static bool _initialized;
+
+    public static void Initialize()
+    {
+        lock (Sync)
+        {
+            if (_initialized)
+                return;
+
+            _minimumLevel = ParseLogLevel(Environment.GetEnvironmentVariable("SAFETYPIN_LOG_LEVEL")) ?? AppLogLevel.Trace;
+            _maxFileBytes = ParseLong(Environment.GetEnvironmentVariable("SAFETYPIN_LOG_MAX_BYTES"), 10 * 1024 * 1024);
+            _maxRotatedFiles = (int)ParseLong(Environment.GetEnvironmentVariable("SAFETYPIN_LOG_MAX_FILES"), 5);
+
+            _logFilePath = Environment.GetEnvironmentVariable("SAFETYPIN_LOG_PATH") ?? GetDefaultLogPath();
+            var logDir = Path.GetDirectoryName(_logFilePath) ?? AppDomain.CurrentDomain.BaseDirectory;
+            Directory.CreateDirectory(logDir);
+
+            _writer = CreateWriter(_logFilePath);
+
+            _originalErrorWriter = Console.Error;
+            Console.SetError(new InterceptingErrorWriter(_originalErrorWriter));
+            _initialized = true;
+
+            Write(AppLogLevel.Info, $"Logger initialized: path={_logFilePath}, max_bytes={_maxFileBytes}, max_files={_maxRotatedFiles}, min_level={_minimumLevel}");
+        }
+    }
+
+    public static void Shutdown()
+    {
+        lock (Sync)
+        {
+            if (!_initialized)
+                return;
+
+            try
+            {
+                Write(AppLogLevel.Info, "Logger shutdown requested");
+                _writer?.Flush();
+                _writer?.Dispose();
+            }
+            catch
+            {
+            }
+            finally
+            {
+                _writer = null;
+                if (_originalErrorWriter != null)
+                {
+                    Console.SetError(_originalErrorWriter);
+                }
+                _initialized = false;
+            }
+        }
+    }
+
+    public static void Write(AppLogLevel level, string message)
+    {
+        lock (Sync)
+        {
+            if (!_initialized || level < _minimumLevel)
+                return;
+
+            if (_writer == null)
+                _writer = CreateWriter(_logFilePath);
+
+            RotateIfNeeded(message);
+            var timestamp = DateTimeOffset.Now.ToString("yyyy-MM-dd HH:mm:ss.fff zzz");
+            var scopeSuffix = string.IsNullOrWhiteSpace(CurrentRequestScope.Value) ? string.Empty : $" [req:{CurrentRequestScope.Value}]";
+            var line = $"{timestamp} [{level.ToString().ToUpperInvariant()}]{scopeSuffix} {message}";
+            _writer!.WriteLine(line);
+            _writer.Flush();
+        }
+    }
+
+    public static IDisposable BeginRequestScope(string scopeId)
+    {
+        var previousScope = CurrentRequestScope.Value;
+        CurrentRequestScope.Value = scopeId;
+        return new RequestScope(previousScope);
+    }
+
+    public static void SetRequestScope(string scopeId)
+    {
+        CurrentRequestScope.Value = scopeId;
+    }
+
+    public static void ClearRequestScope()
+    {
+        CurrentRequestScope.Value = null;
+    }
+
+    public static void WriteRawConsoleError(string message)
+    {
+        var mappedLevel = InferLevelFromMessage(message);
+        Write(mappedLevel, StripLevelPrefix(message));
+    }
+
+    private static void RotateIfNeeded(string nextMessage)
+    {
+        if (_writer == null)
+            return;
+
+        try
+        {
+            var estimatedBytes = Encoding.UTF8.GetByteCount(nextMessage) + 128;
+            var currentLength = _writer.BaseStream.Length;
+
+            if (currentLength + estimatedBytes < _maxFileBytes)
+                return;
+
+            _writer.Flush();
+            _writer.Dispose();
+            _writer = null;
+
+            var oldest = _logFilePath + "." + _maxRotatedFiles;
+            if (File.Exists(oldest))
+                File.Delete(oldest);
+
+            for (int index = _maxRotatedFiles - 1; index >= 1; index--)
+            {
+                var source = _logFilePath + "." + index;
+                var target = _logFilePath + "." + (index + 1);
+                if (File.Exists(source))
+                {
+                    File.Move(source, target, true);
+                }
+            }
+
+            if (File.Exists(_logFilePath))
+            {
+                File.Move(_logFilePath, _logFilePath + ".1", true);
+            }
+
+            _writer = CreateWriter(_logFilePath);
+            var rotationNote = $"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss.fff zzz} [INFO] Log rotated";
+            _writer.WriteLine(rotationNote);
+            _writer.Flush();
+        }
+        catch
+        {
+        }
+    }
+
+    private static StreamWriter CreateWriter(string path)
+    {
+        var fileStream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+        return new StreamWriter(fileStream, Encoding.UTF8) { AutoFlush = true };
+    }
+
+    private static string GetDefaultLogPath()
+    {
+        string logDir;
+
+        if (OperatingSystem.IsWindows())
+        {
+            var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            logDir = Path.Combine(localAppData, "SafetyPin", "Logs");
+        }
+        else if (OperatingSystem.IsMacOS())
+        {
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            logDir = Path.Combine(home, "Library", "Logs", "SafetyPin");
+        }
+        else
+        {
+            var home = Environment.GetEnvironmentVariable("HOME") ?? "/tmp";
+            logDir = Path.Combine(home, ".local", "share", "safetypin", "logs");
+        }
+
+        return Path.Combine(logDir, "native-host.log");
+    }
+
+    private static AppLogLevel InferLevelFromMessage(string message)
+    {
+        if (message.Contains("[TRACE]", StringComparison.OrdinalIgnoreCase)) return AppLogLevel.Trace;
+        if (message.Contains("[DEBUG]", StringComparison.OrdinalIgnoreCase)) return AppLogLevel.Debug;
+        if (message.Contains("[INFO]", StringComparison.OrdinalIgnoreCase)) return AppLogLevel.Info;
+        if (message.Contains("[WARNING]", StringComparison.OrdinalIgnoreCase) || message.Contains("[WARN]", StringComparison.OrdinalIgnoreCase)) return AppLogLevel.Warning;
+        if (message.Contains("[ERROR]", StringComparison.OrdinalIgnoreCase)) return AppLogLevel.Error;
+        return AppLogLevel.Info;
+    }
+
+    private static string StripLevelPrefix(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return string.Empty;
+
+        var trimmed = message.TrimStart();
+        var prefixes = new[] { "[TRACE]", "[DEBUG]", "[INFO]", "[WARNING]", "[WARN]", "[ERROR]" };
+        foreach (var prefix in prefixes)
+        {
+            if (trimmed.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return trimmed.Substring(prefix.Length).TrimStart();
+            }
+        }
+
+        return message;
+    }
+
+    private static AppLogLevel? ParseLogLevel(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        return value.Trim().ToUpperInvariant() switch
+        {
+            "TRACE" => AppLogLevel.Trace,
+            "DEBUG" => AppLogLevel.Debug,
+            "INFO" => AppLogLevel.Info,
+            "WARNING" => AppLogLevel.Warning,
+            "WARN" => AppLogLevel.Warning,
+            "ERROR" => AppLogLevel.Error,
+            "NONE" => AppLogLevel.None,
+            _ => null
+        };
+    }
+
+    private static long ParseLong(string? value, long fallback)
+    {
+        return long.TryParse(value, out var parsed) && parsed > 0 ? parsed : fallback;
+    }
+
+    private sealed class InterceptingErrorWriter : TextWriter
+    {
+        private readonly TextWriter _inner;
+
+        public InterceptingErrorWriter(TextWriter inner)
+        {
+            _inner = inner;
+        }
+
+        public override Encoding Encoding => Encoding.UTF8;
+
+        public override void WriteLine(string? value)
+        {
+            var message = value ?? string.Empty;
+            try
+            {
+                AppLogger.WriteRawConsoleError(message);
+            }
+            catch
+            {
+            }
+
+            _inner.WriteLine(message);
+        }
+
+        public override void Write(string? value)
+        {
+            _inner.Write(value);
+        }
+    }
+
+    private sealed class RequestScope : IDisposable
+    {
+        private readonly string? _previousScope;
+        private bool _disposed;
+
+        public RequestScope(string? previousScope)
+        {
+            _previousScope = previousScope;
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+
+            CurrentRequestScope.Value = _previousScope;
+            _disposed = true;
+        }
     }
 }
