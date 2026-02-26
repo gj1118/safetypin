@@ -2,9 +2,13 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Net.Mail;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -27,6 +31,8 @@ public class Program
     private const int MaxTextLength = 256;
     private const int DomImageParallelism = 4;
     private const double LowReputationSafetyThreshold = 0.70;
+    private const double NotificationSafetyThreshold = 0.80;
+    private static readonly TimeSpan NotificationCooldown = TimeSpan.FromMinutes(5);
     
     private static InferenceSession? _imageSession;
     private static InferenceSession? _textSession;
@@ -51,6 +57,7 @@ public class Program
 
     private static readonly object _dbLock = new object();
     private static string _sqliteDbPath = string.Empty;
+    private static readonly ConcurrentDictionary<string, long> _lastNotificationByKey = new();
 
     public static int Main(string[] args)
     {
@@ -1792,6 +1799,18 @@ LIMIT $limit;";
         var safetyScore = 1.0 - riskScore;
         var blockedPageShown = string.Equals(actionTaken, "page_blocked", StringComparison.OrdinalIgnoreCase);
 
+        if (blockedPageShown || safetyScore < NotificationSafetyThreshold)
+        {
+            TrySendVisitNotifications(
+                visitedUrl,
+                domain,
+                safetyScore,
+                blockedPageShown,
+                reasons,
+                analysisType,
+                pageClassification);
+        }
+
         if (safetyScore >= LowReputationSafetyThreshold && !blockedPageShown)
             return;
 
@@ -1827,6 +1846,177 @@ VALUES
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[ERROR] Failed to record low-reputation visit: {ex.Message}");
+        }
+    }
+
+    private static void TrySendVisitNotifications(
+        string visitedUrl,
+        string domain,
+        double safetyScore,
+        bool blockedPageShown,
+        List<string> reasons,
+        string analysisType,
+        string pageClassification)
+    {
+        try
+        {
+            var notificationType = blockedPageShown ? "blocked" : "low_reputation";
+            var dedupKey = $"{notificationType}:{domain}".ToLowerInvariant();
+            if (!ShouldSendNotificationNow(dedupKey))
+            {
+                return;
+            }
+
+            var userInfo = GetUserInfo();
+            if (string.IsNullOrWhiteSpace(userInfo.email) && string.IsNullOrWhiteSpace(userInfo.phone))
+            {
+                return;
+            }
+
+            var safetyPercent = Math.Clamp(safetyScore * 100.0, 0.0, 100.0);
+            var reasonsText = reasons.Count == 0 ? "none" : string.Join(", ", reasons.Distinct());
+            var eventLabel = blockedPageShown ? "Site blocked" : "Low protection score visit";
+
+            var subject = $"SafeNest Alert: {eventLabel} ({domain})";
+            var body =
+                $"Event: {eventLabel}\n" +
+                $"Domain: {domain}\n" +
+                $"URL: {visitedUrl}\n" +
+                $"Protection score: {safetyPercent.ToString("0.0", CultureInfo.InvariantCulture)}%\n" +
+                $"Analysis: {analysisType}\n" +
+                $"Classification: {pageClassification}\n" +
+                $"Reasons: {reasonsText}\n" +
+                $"Timestamp (UTC): {DateTime.UtcNow:O}";
+
+            var smsBody =
+                $"SafeNest alert: {(blockedPageShown ? "site blocked" : "low score site")}. " +
+                $"{domain} ({safetyPercent.ToString("0.0", CultureInfo.InvariantCulture)}%).";
+
+            if (!string.IsNullOrWhiteSpace(userInfo.email))
+            {
+                _ = TrySendEmailNotification(userInfo.email, subject, body);
+            }
+
+            if (!string.IsNullOrWhiteSpace(userInfo.phone))
+            {
+                _ = TrySendSmsNotification(userInfo.phone, smsBody);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ERROR] Failed to send notifications: {ex.Message}");
+        }
+    }
+
+    private static bool ShouldSendNotificationNow(string dedupKey)
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var cooldownSeconds = (long)NotificationCooldown.TotalSeconds;
+
+        if (_lastNotificationByKey.TryGetValue(dedupKey, out var previousSentAt))
+        {
+            if (now - previousSentAt < cooldownSeconds)
+            {
+                return false;
+            }
+        }
+
+        _lastNotificationByKey[dedupKey] = now;
+        return true;
+    }
+
+    private static bool TrySendEmailNotification(string recipientEmail, string subject, string body)
+    {
+        try
+        {
+            var smtpHost = Environment.GetEnvironmentVariable("SAFETYPIN_SMTP_HOST") ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(smtpHost))
+            {
+                Console.Error.WriteLine("[WARNING] Email notification skipped: SAFETYPIN_SMTP_HOST is not set.");
+                return false;
+            }
+
+            var smtpPortRaw = Environment.GetEnvironmentVariable("SAFETYPIN_SMTP_PORT");
+            var smtpPort = 587;
+            if (!string.IsNullOrWhiteSpace(smtpPortRaw) && int.TryParse(smtpPortRaw, out var parsedPort) && parsedPort > 0)
+            {
+                smtpPort = parsedPort;
+            }
+
+            var smtpUser = Environment.GetEnvironmentVariable("SAFETYPIN_SMTP_USER") ?? string.Empty;
+            var smtpPass = Environment.GetEnvironmentVariable("SAFETYPIN_SMTP_PASS") ?? string.Empty;
+            var smtpFrom = Environment.GetEnvironmentVariable("SAFETYPIN_EMAIL_FROM");
+            var fromAddress = !string.IsNullOrWhiteSpace(smtpFrom)
+                ? smtpFrom
+                : (!string.IsNullOrWhiteSpace(smtpUser) ? smtpUser : "alerts@safenest.local");
+
+            var enableSslRaw = Environment.GetEnvironmentVariable("SAFETYPIN_SMTP_SSL") ?? "true";
+            var enableSsl = !string.Equals(enableSslRaw, "false", StringComparison.OrdinalIgnoreCase);
+
+            using var smtpClient = new SmtpClient(smtpHost, smtpPort)
+            {
+                EnableSsl = enableSsl
+            };
+
+            if (!string.IsNullOrWhiteSpace(smtpUser))
+            {
+                smtpClient.Credentials = new NetworkCredential(smtpUser, smtpPass);
+            }
+
+            using var message = new MailMessage(fromAddress, recipientEmail, subject, body);
+            smtpClient.Send(message);
+            Console.Error.WriteLine($"[INFO] Email notification sent to {recipientEmail}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ERROR] Email notification failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static bool TrySendSmsNotification(string recipientPhone, string message)
+    {
+        try
+        {
+            var accountSid = Environment.GetEnvironmentVariable("SAFETYPIN_TWILIO_ACCOUNT_SID") ?? string.Empty;
+            var authToken = Environment.GetEnvironmentVariable("SAFETYPIN_TWILIO_AUTH_TOKEN") ?? string.Empty;
+            var fromPhone = Environment.GetEnvironmentVariable("SAFETYPIN_TWILIO_FROM_PHONE") ?? string.Empty;
+
+            if (string.IsNullOrWhiteSpace(accountSid) || string.IsNullOrWhiteSpace(authToken) || string.IsNullOrWhiteSpace(fromPhone))
+            {
+                Console.Error.WriteLine("[WARNING] SMS notification skipped: Twilio environment variables are not fully configured.");
+                return false;
+            }
+
+            using var request = new HttpRequestMessage(
+                HttpMethod.Post,
+                $"https://api.twilio.com/2010-04-01/Accounts/{accountSid}/Messages.json");
+
+            var basicToken = Convert.ToBase64String(Encoding.UTF8.GetBytes($"{accountSid}:{authToken}"));
+            request.Headers.Authorization = new AuthenticationHeaderValue("Basic", basicToken);
+            request.Content = new FormUrlEncodedContent(new Dictionary<string, string>
+            {
+                ["To"] = recipientPhone,
+                ["From"] = fromPhone,
+                ["Body"] = message
+            });
+
+            using var response = _httpClient.Send(request);
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                Console.Error.WriteLine($"[ERROR] SMS notification failed: {response.StatusCode} {errorBody}");
+                return false;
+            }
+
+            Console.Error.WriteLine($"[INFO] SMS notification sent to {recipientPhone}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[ERROR] SMS notification failed: {ex.Message}");
+            return false;
         }
     }
 
