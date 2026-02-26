@@ -122,6 +122,7 @@ function renderMissingDetails() {
 }
 
 if (view === "details") {
+  document.body.classList.add("details-mode");
   const reportId = params.get("id");
   if (!reportId) {
     renderMissingDetails();

@@ -4,7 +4,7 @@ const NATIVE_HOST_NAME = "com.safetypin.native";
 let nativePort = null;
 let isConnected = false;
 const tabAnalysisState = new Map();
-const ANALYSIS_COOLDOWN_MS = 8000;
+const ANALYSIS_COOLDOWN_MS = 5000;
 
 function connectToNative() {
   console.log("Connecting to native host:", NATIVE_HOST_NAME);
@@ -314,7 +314,7 @@ function scheduleAutoAnalysis(tabId, url, trigger, force = false) {
         lastUrl: url
       });
     });
-  }, 500);
+  }, 150);
 }
 
 // Auto-analyze pages as they load

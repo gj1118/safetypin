@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { AlertTriangle, CheckCircle2, FileText, Globe, ImageIcon, Loader2, Shield, HeartPlus, Settings } from "lucide-react";
+import { AlertTriangle, CheckCircle2, FileText, Globe, ImageIcon, Loader2, Shield, HeartPlus, Settings, CirclePlay, ShieldUser } from "lucide-react";
 import { useNativeMessaging } from "../hooks/useNativeMessaging";
 
 function Popup() {
@@ -107,13 +107,13 @@ function Popup() {
   };
 
   return (
-    <div className="min-h-[600px] bg-gradient-to-b from-slate-50 to-slate-100 flex flex-col">
+    <div className="h-[600px] overflow-hidden bg-gradient-to-b from-slate-50 to-slate-100 flex flex-col">
 
       <header className="border-b border-slate-200 bg-white px-5 py-4" >
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2.5">
             <div className="size-9 rounded-xl bg-indigo-600 flex items-center justify-center shadow-sm">
-              <Shield className="size-4 text-white" strokeWidth={2.5} />
+              <ShieldUser className="size-4 text-white" strokeWidth={2.5} />
             </div>
             <div>
               <h1 className="text-base font-semibold tracking-tight text-slate-900">SafeNest</h1>
@@ -130,7 +130,7 @@ function Popup() {
         </div>
       </header>
 
-      <div className="flex-1 overflow-y-auto px-5 py-4">
+      <div className="flex-1 overflow-y-auto no-scrollbar px-5 py-4">
         {analysisResult && (
           <div >
             <div className={`rounded-xl px-3.5 py-3 border ${
@@ -247,7 +247,7 @@ function Popup() {
         {!analysisResult && !loading && (
           <div className="h-full min-h-[220px] flex flex-col items-center justify-center text-center">
             <div className="size-12 rounded-full bg-white border border-slate-200 shadow-sm flex items-center justify-center mb-3">
-              <Shield className="size-5 text-slate-500" strokeWidth={1.8} />
+              <ShieldUser className="size-7 text-slate-500" strokeWidth={1.8} />
             </div>
             <p className="text-sm font-semibold text-slate-900">Ready to scan this page</p>
             <p className="mt-1 text-xs text-slate-500">Run verification to see a full safety report.</p>
@@ -272,7 +272,7 @@ function Popup() {
             disabled={loading}
             className="inline-flex min-w-[230px] items-center justify-center rounded-2xl bg-indigo-600 px-10 py-2 text-sm font-semibold tracking-tight text-white shadow-[0_10px_20px_rgba(79,70,229,0.28)] hover:bg-indigo-500 transition-all focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 disabled:bg-indigo-400 disabled:cursor-not-allowed"
           >
-            {loading ? "Scanning…" : "Run Verification"}
+            {loading ? "Scanning…" : <span className="inline-flex items-center"><CirclePlay className="size-4 mr-1" /> Run Verification</span>}
           </button>
         </div>
 

@@ -451,6 +451,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       });
     });
     
+    const prioritizedImages = images
+      .sort((a, b) => ((b.width || 0) * (b.height || 0)) - ((a.width || 0) * (a.height || 0)))
+      .slice(0, 24);
+
     // Get text content from main elements
     const textSelectors = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'a', 'li', 'td', 'th'];
     const textElements = [];
@@ -468,14 +472,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       });
     });
     
+    const cappedTextElements = textElements.slice(0, 120);
+
     const domData = {
       url: window.location.href,
       html: "",
-      images: images,
-      textElements: textElements,
+      images: prioritizedImages,
+      textElements: cappedTextElements,
     };
     
-    console.log("Sending DOM data:", { images: images.length, textElements: textElements.length });
+    console.log("Sending DOM data:", { images: prioritizedImages.length, textElements: cappedTextElements.length });
     sendResponse({ success: true, domData: domData });
     return true;
   }

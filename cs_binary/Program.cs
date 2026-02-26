@@ -31,6 +31,7 @@ public class Program
     private const int MaxTextLength = 256;
     private const int DomImageParallelism = 4;
     private const double LowReputationSafetyThreshold = 0.70;
+    private const double MinBadImageConfidenceForBlocking = 0.85;
     private const double NotificationSafetyThreshold = 0.80;
     private static readonly TimeSpan NotificationCooldown = TimeSpan.FromMinutes(5);
     
@@ -61,6 +62,7 @@ public class Program
 
     public static int Main(string[] args)
     {
+        LoadDotEnvIfPresent();
         AppLogger.Initialize();
         Console.Error.WriteLine("[INFO] C# Native Messaging Host starting...");
 
@@ -245,6 +247,97 @@ public class Program
         {
             Console.Error.WriteLine($"[ERROR] Failed to load domain classifier: {ex.Message}");
         }
+    }
+
+    private static void LoadDotEnvIfPresent()
+    {
+        try
+        {
+            var candidates = new List<string>();
+
+            var explicitEnvPath = Environment.GetEnvironmentVariable("SAFETYPIN_ENV_PATH");
+            if (!string.IsNullOrWhiteSpace(explicitEnvPath))
+            {
+                candidates.Add(explicitEnvPath);
+            }
+
+            var currentDirectory = Directory.GetCurrentDirectory();
+            candidates.Add(Path.Combine(currentDirectory, ".env"));
+
+            var baseDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            candidates.Add(Path.Combine(baseDirectory, ".env"));
+
+            var probeDirectory = new DirectoryInfo(baseDirectory);
+            for (var i = 0; i < 4 && probeDirectory != null; i++)
+            {
+                candidates.Add(Path.Combine(probeDirectory.FullName, ".env"));
+                probeDirectory = probeDirectory.Parent;
+            }
+
+            var resolvedPath = candidates
+                .Where(path => !string.IsNullOrWhiteSpace(path))
+                .Select(path => Path.GetFullPath(path))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault(File.Exists);
+
+            if (string.IsNullOrWhiteSpace(resolvedPath))
+            {
+                Console.Error.WriteLine("[DEBUG] No .env file found for native host startup.");
+                return;
+            }
+
+            var loadedCount = ApplyEnvFile(resolvedPath);
+            Console.Error.WriteLine($"[INFO] Loaded {loadedCount} environment variable(s) from {resolvedPath}");
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[WARNING] Failed to load .env file: {ex.Message}");
+        }
+    }
+
+    private static int ApplyEnvFile(string filePath)
+    {
+        var applied = 0;
+
+        foreach (var rawLine in File.ReadLines(filePath))
+        {
+            var line = rawLine.Trim();
+            if (string.IsNullOrWhiteSpace(line) || line.StartsWith("#", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var separatorIndex = line.IndexOf('=');
+            if (separatorIndex <= 0)
+            {
+                continue;
+            }
+
+            var key = line.Substring(0, separatorIndex).Trim();
+            if (!Regex.IsMatch(key, "^[A-Za-z_][A-Za-z0-9_]*$"))
+            {
+                continue;
+            }
+
+            var currentValue = Environment.GetEnvironmentVariable(key);
+            if (!string.IsNullOrWhiteSpace(currentValue))
+            {
+                continue;
+            }
+
+            var value = line[(separatorIndex + 1)..].Trim();
+            if (value.Length >= 2 &&
+                ((value.StartsWith('"') && value.EndsWith('"')) || (value.StartsWith('\'') && value.EndsWith('\''))))
+            {
+                value = value[1..^1];
+            }
+
+            value = value.Replace("\\n", "\n", StringComparison.Ordinal);
+            Environment.SetEnvironmentVariable(key, value);
+            applied += 1;
+        }
+
+        return applied;
     }
 
     private static void RunMessagingHost()
@@ -796,10 +889,10 @@ public class Program
                                     ["element_info"] = elementInfo
                                 });
 
-                                if (imgResult.Classification == "good")
-                                    goodImages++;
-                                else
+                                if (imgResult.Classification == "bad" && imgResult.Confidence >= MinBadImageConfidenceForBlocking)
                                     badImages++;
+                                else
+                                    goodImages++;
 
                                 Console.Error.WriteLine($"[INFO] Image classified: {imgUrl} -> {imgResult.Classification} ({imgResult.Confidence:P2})");
                             }
@@ -813,7 +906,8 @@ public class Program
                     foreach (var img in analyzedImages)
                     {
                         var imgDict = (Dictionary<string, object>)img;
-                        if (imgDict["classification"]?.ToString() == "bad")
+                        if (imgDict["classification"]?.ToString() == "bad"
+                            && Convert.ToDouble(imgDict["confidence"] ?? 0.0) >= MinBadImageConfidenceForBlocking)
                         {
                             badImageElements.Add(new Dictionary<string, object>
                             {
@@ -961,6 +1055,83 @@ public class Program
         {
             Console.Error.WriteLine($"[INFO] Analyzing DOM from extension. URL: {url}, Images: {images?.Count ?? 0}, Text elements: {textElements?.Count ?? 0}");
 
+            string domainStr = "";
+            string domainReputation = "unknown";
+            bool inDb = false;
+            double domainRiskScore = 0.5;
+
+            if (!string.IsNullOrEmpty(url))
+            {
+                try
+                {
+                    var uri = new Uri(url);
+                    domainStr = uri.Host;
+                    domainRiskScore = ClassifyDomain(domainStr);
+
+                    if (TryGetDomainReputation(domainStr, out domainReputation))
+                    {
+                        inDb = true;
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            if (domainRiskScore >= 0.9)
+            {
+                Console.Error.WriteLine($"[INFO] Domain {domainStr} has high risk ({domainRiskScore:P0}), blocking entire page before content scan");
+
+                var immediateResponse = new Dictionary<string, object>
+                {
+                    ["page_classification"] = "bad",
+                    ["page_confidence"] = domainRiskScore,
+                    ["page_reasons"] = new[] { domainReputation == "phishing" ? "known_phishing_domain" : "domain_high_risk" },
+                    ["action_taken"] = "page_blocked",
+                    ["text_analysis"] = new Dictionary<string, object>
+                    {
+                        ["classification"] = "unknown",
+                        ["confidence"] = 0.0,
+                        ["reason"] = "domain_high_risk_short_circuit",
+                        ["bad_text_elements"] = new List<object>()
+                    },
+                    ["image_analysis"] = new Dictionary<string, object>
+                    {
+                        ["has_harmful_images"] = false,
+                        ["images_analyzed"] = 0,
+                        ["bad_images"] = 0,
+                        ["good_images"] = 0,
+                        ["bad_image_elements"] = new List<object>()
+                    },
+                    ["domain_analysis"] = new Dictionary<string, object>
+                    {
+                        ["domain"] = domainStr,
+                        ["risk_score"] = domainRiskScore,
+                        ["category"] = domainReputation,
+                        ["in_database"] = inDb
+                    },
+                    ["type"] = "dom",
+                    ["requested_url"] = url ?? "",
+                    ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                };
+
+                if (requestId.HasValue)
+                    immediateResponse["requestId"] = requestId.Value;
+
+                RecordLowReputationVisitIfNeeded(
+                    url,
+                    domainStr,
+                    domainRiskScore,
+                    "dom_analysis",
+                    "bad",
+                    new List<string> { domainReputation == "phishing" ? "known_phishing_domain" : "domain_high_risk" },
+                    "page_blocked");
+
+                domStopwatch.Stop();
+                Console.Error.WriteLine($"[INFO] DOM analysis short-circuited in {domStopwatch.ElapsedMilliseconds} ms for url={url}");
+                return SerializeResponse(immediateResponse);
+            }
+
             bool foundBad = false;
             double highestConfidence = 0.0;
             var textAnalysisStopwatch = Stopwatch.StartNew();
@@ -1021,6 +1192,7 @@ public class Program
 
                 if (!foundBad)
                 {
+                    textAnalysis["reason"] = "text_scanned_no_harmful_content";
                     textAnalysis["bad_text_elements"] = textElementResults;
                 }
                 Console.Error.WriteLine($"[INFO] Text analysis done. Bad elements: {textElementResults.Count}");
@@ -1028,57 +1200,6 @@ public class Program
 
             textAnalysisStopwatch.Stop();
             Console.Error.WriteLine($"[DEBUG] Text analysis duration_ms={textAnalysisStopwatch.ElapsedMilliseconds}");
-
-            // Get domain risk score BEFORE the early return check
-            double domainRiskForText = 0.5;
-            string domainStrForText = "";
-            if (!string.IsNullOrEmpty(url))
-            {
-                try
-                {
-                    var uri = new Uri(url);
-                    domainStrForText = uri.Host;
-                    domainRiskForText = ClassifyDomain(domainStrForText);
-                }
-                catch { }
-            }
-
-            // For high reputation domains, don't block on text false positives
-            // Only return early for high-risk domains or harmful images
-            if (foundBad && domainRiskForText >= 0.9)
-            {
-                var earlyResponse = new Dictionary<string, object>
-                {
-                    ["page_classification"] = "bad",
-                    ["page_confidence"] = highestConfidence,
-                    ["page_reasons"] = new[] { "harmful_text_detected" },
-                    ["action_taken"] = "page_blocked",
-                    ["text_analysis"] = textAnalysis,
-                    ["image_analysis"] = new Dictionary<string, object>
-                    {
-                        ["has_harmful_images"] = false,
-                        ["images_analyzed"] = 0,
-                        ["bad_images"] = 0,
-                        ["good_images"] = 0,
-                        ["bad_image_elements"] = new List<object>()
-                    },
-                    ["domain_analysis"] = new Dictionary<string, object>
-                    {
-                        ["domain"] = domainStrForText,
-                        ["risk_score"] = domainRiskForText,
-                        ["category"] = "unknown",
-                        ["in_database"] = false
-                    },
-                    ["type"] = "dom",
-                    ["requested_url"] = url ?? "",
-                    ["timestamp"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds()
-                };
-
-                if (requestId.HasValue)
-                    earlyResponse["requestId"] = requestId.Value;
-
-                return SerializeResponse(earlyResponse);
-            }
 
             var imageAnalysis = new Dictionary<string, object>
             {
@@ -1112,19 +1233,35 @@ public class Program
                     uniqueImageDicts.Add(imgDict);
                 }
 
+                uniqueImageDicts = uniqueImageDicts
+                    .OrderByDescending(img =>
+                    {
+                        var width = Convert.ToInt32(img.ContainsKey("width") ? img["width"] : 0);
+                        var height = Convert.ToInt32(img.ContainsKey("height") ? img["height"] : 0);
+                        return width * height;
+                    })
+                    .Take(18)
+                    .ToList();
+
                 Console.Error.WriteLine($"[DEBUG] DOM image analysis: unique_images={uniqueImageDicts.Count}, parallelism={DomImageParallelism}");
 
                 var badImageBag = new ConcurrentBag<object>();
                 var confidenceLock = new object();
+                var imageLoopCancellation = new CancellationTokenSource();
+                var badImagesFound = 0;
                 var parallelOptions = new ParallelOptions
                 {
-                    MaxDegreeOfParallelism = DomImageParallelism
+                    MaxDegreeOfParallelism = DomImageParallelism,
+                    CancellationToken = imageLoopCancellation.Token
                 };
 
                 try
                 {
-                    Parallel.ForEach(uniqueImageDicts, parallelOptions, (imgDict) =>
+                    Parallel.ForEach(uniqueImageDicts, parallelOptions, (imgDict, loopState) =>
                     {
+                        if (loopState.ShouldExitCurrentIteration)
+                            return;
+
                         var imgUrl = imgDict["src"]?.ToString() ?? "";
                         if (string.IsNullOrEmpty(imgUrl))
                             return;
@@ -1148,7 +1285,7 @@ public class Program
 
                             Console.Error.WriteLine($"[INFO] Image classified: {imgUrl} -> {imgResult.Classification}");
 
-                            if (imgResult.Classification == "bad")
+                            if (imgResult.Classification == "bad" && imgResult.Confidence >= MinBadImageConfidenceForBlocking)
                             {
                                 badImageBag.Add(new Dictionary<string, object>
                                 {
@@ -1172,6 +1309,12 @@ public class Program
                                         maxBadImageConfidence = imgResult.Confidence;
                                     }
                                 }
+
+                                if (Interlocked.Increment(ref badImagesFound) >= 2)
+                                {
+                                    imageLoopCancellation.Cancel();
+                                    loopState.Stop();
+                                }
                             }
                         }
                         catch (OperationCanceledException)
@@ -1184,6 +1327,7 @@ public class Program
                 }
                 catch (OperationCanceledException)
                 {
+                    Console.Error.WriteLine("[DEBUG] DOM image analysis short-circuited after block threshold reached");
                 }
 
                 badImageElements.AddRange(badImageBag.Cast<object>());
@@ -1202,45 +1346,8 @@ public class Program
             var finalConfidence = 0.5;
             var finalReasons = new List<string>();
 
-            // TWO-PASS CHECK:
-            // 1. First check domain reputation using classifier
-            // 2. If domain risk >= 90%, block entire page
-            // 3. If domain risk < 90%, analyze and remove offending content
-            
-            string domainStr = "";
-            string domainReputation = "unknown";
-            bool inDb = false;
-            double domainRiskScore = 0.5;
+            // Domain risk was already computed before content analysis.
             bool shouldBlockEntirePage = false;
-            
-            if (!string.IsNullOrEmpty(url))
-            {
-                try
-                {
-                    var uri = new Uri(url);
-                    domainStr = uri.Host;
-                    
-                    // Use the new domain classifier
-                    domainRiskScore = ClassifyDomain(domainStr);
-                    
-                    // Check reputation database for category
-                    if (TryGetDomainReputation(domainStr, out domainReputation))
-                    {
-                        inDb = true;
-                    }
-                    
-                    // If domain risk >= 90%, block entire page immediately
-                    if (domainRiskScore >= 0.9)
-                    {
-                        shouldBlockEntirePage = true;
-                        finalClassification = "bad";
-                        finalConfidence = domainRiskScore;
-                        finalReasons.Add(domainReputation == "phishing" ? "known_phishing_domain" : "domain_high_risk");
-                        Console.Error.WriteLine($"[INFO] Domain {domainStr} has high risk ({domainRiskScore:P0}), blocking entire page");
-                    }
-                }
-                catch { }
-            }
 
             // If domain is high risk, skip content analysis and block immediately
             if (!shouldBlockEntirePage)
@@ -1862,18 +1969,23 @@ VALUES
         {
             var notificationType = blockedPageShown ? "blocked" : "low_reputation";
             var dedupKey = $"{notificationType}:{domain}".ToLowerInvariant();
+            var safetyPercent = Math.Clamp(safetyScore * 100.0, 0.0, 100.0);
+            Console.Error.WriteLine(
+                $"[DEBUG] Notification trigger candidate: type={notificationType}, domain={domain}, safety_pct={safetyPercent.ToString("0.0", CultureInfo.InvariantCulture)}, action={pageClassification}/{analysisType}, url={visitedUrl}");
+
             if (!ShouldSendNotificationNow(dedupKey))
             {
+                Console.Error.WriteLine($"[DEBUG] Notification suppressed by cooldown: key={dedupKey}");
                 return;
             }
 
             var userInfo = GetUserInfo();
             if (string.IsNullOrWhiteSpace(userInfo.email) && string.IsNullOrWhiteSpace(userInfo.phone))
             {
+                Console.Error.WriteLine("[WARNING] Notification skipped: user has no email or phone configured.");
                 return;
             }
 
-            var safetyPercent = Math.Clamp(safetyScore * 100.0, 0.0, 100.0);
             var reasonsText = reasons.Count == 0 ? "none" : string.Join(", ", reasons.Distinct());
             var eventLabel = blockedPageShown ? "Site blocked" : "Low protection score visit";
 
@@ -1892,15 +2004,34 @@ VALUES
                 $"SafeNest alert: {(blockedPageShown ? "site blocked" : "low score site")}. " +
                 $"{domain} ({safetyPercent.ToString("0.0", CultureInfo.InvariantCulture)}%).";
 
-            if (!string.IsNullOrWhiteSpace(userInfo.email))
-            {
-                _ = TrySendEmailNotification(userInfo.email, subject, body);
-            }
+            Console.Error.WriteLine(
+                $"[DEBUG] Notification recipients: email_set={!string.IsNullOrWhiteSpace(userInfo.email)}, email={MaskEmail(userInfo.email)}, phone_set={!string.IsNullOrWhiteSpace(userInfo.phone)}, phone={MaskPhone(userInfo.phone)}");
 
-            if (!string.IsNullOrWhiteSpace(userInfo.phone))
+            var recipientEmail = userInfo.email;
+            var recipientPhone = userInfo.phone;
+            _ = Task.Run(() =>
             {
-                _ = TrySendSmsNotification(userInfo.phone, smsBody);
-            }
+                try
+                {
+                    if (!string.IsNullOrWhiteSpace(recipientEmail))
+                    {
+                        var emailSent = TrySendEmailNotification(recipientEmail, subject, body);
+                        Console.Error.WriteLine($"[DEBUG] Email send result: success={emailSent}, recipient={MaskEmail(recipientEmail)}");
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(recipientPhone))
+                    {
+                        var smsSent = TrySendSmsNotification(recipientPhone, smsBody);
+                        Console.Error.WriteLine($"[DEBUG] SMS send result: success={smsSent}, recipient={MaskPhone(recipientPhone)}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine($"[ERROR] Async notification dispatch failed: {ex.Message}");
+                }
+            });
+
+            Console.Error.WriteLine($"[DEBUG] Notification dispatch queued: type={notificationType}, domain={domain}");
         }
         catch (Exception ex)
         {
@@ -1917,11 +2048,14 @@ VALUES
         {
             if (now - previousSentAt < cooldownSeconds)
             {
+                var remainingSeconds = cooldownSeconds - (now - previousSentAt);
+                Console.Error.WriteLine($"[DEBUG] Cooldown active: key={dedupKey}, remaining_seconds={remainingSeconds}");
                 return false;
             }
         }
 
         _lastNotificationByKey[dedupKey] = now;
+        Console.Error.WriteLine($"[DEBUG] Cooldown pass: key={dedupKey}, next_allowed_after_seconds={cooldownSeconds}");
         return true;
     }
 
@@ -1953,6 +2087,11 @@ VALUES
             var enableSslRaw = Environment.GetEnvironmentVariable("SAFETYPIN_SMTP_SSL") ?? "true";
             var enableSsl = !string.Equals(enableSslRaw, "false", StringComparison.OrdinalIgnoreCase);
 
+            Console.Error.WriteLine(
+                $"[DEBUG] Email config: host={(string.IsNullOrWhiteSpace(smtpHost) ? "<unset>" : smtpHost)}, port={smtpPort}, ssl={enableSsl}, smtp_user_set={!string.IsNullOrWhiteSpace(smtpUser)}, smtp_pass_set={!string.IsNullOrWhiteSpace(smtpPass)}, from={MaskEmail(fromAddress)}, to={MaskEmail(recipientEmail)}");
+            Console.Error.WriteLine(
+                $"[DEBUG] Email payload: subject_length={subject.Length}, body_length={body.Length}");
+
             using var smtpClient = new SmtpClient(smtpHost, smtpPort)
             {
                 EnableSsl = enableSsl
@@ -1964,13 +2103,14 @@ VALUES
             }
 
             using var message = new MailMessage(fromAddress, recipientEmail, subject, body);
+            Console.Error.WriteLine($"[INFO] Attempting email notification send to {MaskEmail(recipientEmail)} via {smtpHost}:{smtpPort}");
             smtpClient.Send(message);
-            Console.Error.WriteLine($"[INFO] Email notification sent to {recipientEmail}");
+            Console.Error.WriteLine($"[INFO] Email notification sent to {MaskEmail(recipientEmail)}");
             return true;
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[ERROR] Email notification failed: {ex.Message}");
+            Console.Error.WriteLine($"[ERROR] Email notification failed for {MaskEmail(recipientEmail)}: {ex.Message}");
             return false;
         }
     }
@@ -1982,6 +2122,9 @@ VALUES
             var accountSid = Environment.GetEnvironmentVariable("SAFETYPIN_TWILIO_ACCOUNT_SID") ?? string.Empty;
             var authToken = Environment.GetEnvironmentVariable("SAFETYPIN_TWILIO_AUTH_TOKEN") ?? string.Empty;
             var fromPhone = Environment.GetEnvironmentVariable("SAFETYPIN_TWILIO_FROM_PHONE") ?? string.Empty;
+
+            Console.Error.WriteLine(
+                $"[DEBUG] SMS config: twilio_sid_set={!string.IsNullOrWhiteSpace(accountSid)}, twilio_auth_set={!string.IsNullOrWhiteSpace(authToken)}, from={MaskPhone(fromPhone)}, to={MaskPhone(recipientPhone)}, message_length={message.Length}");
 
             if (string.IsNullOrWhiteSpace(accountSid) || string.IsNullOrWhiteSpace(authToken) || string.IsNullOrWhiteSpace(fromPhone))
             {
@@ -2002,6 +2145,7 @@ VALUES
                 ["Body"] = message
             });
 
+            Console.Error.WriteLine($"[INFO] Attempting SMS notification send to {MaskPhone(recipientPhone)} via Twilio account {MaskIdentifier(accountSid)}");
             using var response = _httpClient.Send(request);
             if (!response.IsSuccessStatusCode)
             {
@@ -2010,7 +2154,7 @@ VALUES
                 return false;
             }
 
-            Console.Error.WriteLine($"[INFO] SMS notification sent to {recipientPhone}");
+            Console.Error.WriteLine($"[INFO] SMS notification sent to {MaskPhone(recipientPhone)}");
             return true;
         }
         catch (Exception ex)
@@ -2018,6 +2162,49 @@ VALUES
             Console.Error.WriteLine($"[ERROR] SMS notification failed: {ex.Message}");
             return false;
         }
+    }
+
+    private static string MaskEmail(string? email)
+    {
+        if (string.IsNullOrWhiteSpace(email))
+            return "<unset>";
+
+        var value = email.Trim();
+        var atIndex = value.IndexOf('@');
+        if (atIndex <= 1 || atIndex >= value.Length - 1)
+            return "***";
+
+        var localPart = value.Substring(0, atIndex);
+        var domainPart = value.Substring(atIndex + 1);
+        var localMasked = localPart.Length <= 2
+            ? localPart[0] + "*"
+            : localPart.Substring(0, 2) + new string('*', Math.Max(localPart.Length - 2, 1));
+
+        return localMasked + "@" + domainPart;
+    }
+
+    private static string MaskPhone(string? phone)
+    {
+        if (string.IsNullOrWhiteSpace(phone))
+            return "<unset>";
+
+        var digits = new string(phone.Where(char.IsDigit).ToArray());
+        if (digits.Length <= 4)
+            return "***";
+
+        return new string('*', digits.Length - 4) + digits.Substring(digits.Length - 4);
+    }
+
+    private static string MaskIdentifier(string? identifier)
+    {
+        if (string.IsNullOrWhiteSpace(identifier))
+            return "<unset>";
+
+        var value = identifier.Trim();
+        if (value.Length <= 6)
+            return "***";
+
+        return value.Substring(0, 2) + new string('*', value.Length - 6) + value.Substring(value.Length - 4);
     }
 
     private static byte[] FormatError(string errorType, string message, double? messageId = null)

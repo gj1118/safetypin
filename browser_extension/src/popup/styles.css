@@ -6,6 +6,10 @@ html, body, #root {
   height: 100%;
 }
 
+#root {
+  overflow: hidden;
+}
+
 html {
   font-size: 17px;
 }
@@ -16,8 +20,20 @@ html {
 
 body {
   width: 340px;
+  height: 600px;
   min-height: 600px;
+  max-height: 600px;
+  overflow: hidden;
   font-family: 'Poppins', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
 }
